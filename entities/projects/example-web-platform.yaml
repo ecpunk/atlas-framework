@@ -1,0 +1,28 @@
+id: example-web-platform
+name: Example Web Platform
+summary: >
+  Demonstration project that owns the example web service. Shows how a project
+  entity carries status, phases, and open items, and how services reference their
+  owning project.
+category: vocab:lifecycle_categories:current
+status: vocab:project_statuses:active
+status_detail: Demo project shipped as a framework example.
+concept_doc: docs/service-entity.md
+domain_tags:
+  - example
+  - web
+related_services:
+  - service:example-web-app
+phases:
+  - id: p1
+    name: Scaffold service entity
+    status: done
+  - id: p2
+    name: Wire portal + infra map
+    status: partial
+open_items:
+  - id: o1
+    description: Add an authenticated admin surface example.
+    created: "2026-01-01"
+created_at: 2026-01-01T00:00:00Z
+updated_at: 2026-01-01T00:00:00Z

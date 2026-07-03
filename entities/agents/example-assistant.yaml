@@ -1,0 +1,28 @@
+id: example-assistant
+name: Example Assistant
+model_family: generic-llm
+interface: vocab:agent_interfaces:cli
+primary_lane: vocab:agent_lanes:implementation
+secondary_lanes:
+  - vocab:agent_lanes:discovery
+can_read:
+  - entities/*
+  - outputs/*
+can_write:
+  - staging/*
+can_execute:
+  - tools/validate.py
+  - tools/pipeline.py
+trust_calibration:
+  - task_pattern: read-only entity queries
+    reliability: vocab:reliability_levels:high
+  - task_pattern: proposing drift remediation stubs
+    reliability: vocab:reliability_levels:medium
+session_duration_typical_minutes: 30
+known_failure_modes:
+  - may over-generalize from a single entity example
+known_strengths:
+  - fast schema-aware entity edits
+telemetry_source: null
+created_at: 2026-01-01T00:00:00Z
+updated_at: 2026-01-01T00:00:00Z

@@ -1,0 +1,33 @@
+id: example-writing-style
+name: Example Writing Style
+version: "1.0"
+summary: >
+  A reusable skill definition demonstrating how operator/agent skills are stored
+  as canonical entities and rendered to SKILL.md for different runtimes.
+description: >
+  Encodes a plain, direct writing style: short sentences, active voice, no filler.
+  Included as a fictional example so the skill_md generator has an entity to render.
+context_mode: vocab:context_modes:main
+publish_targets:
+  - target_id: claude-desktop
+    output_path: outputs/skills/example-writing-style/SKILL.md
+  - target_id: copilot-vscode
+    output_path: outputs/skills/example-writing-style/copilot/SKILL.md
+frontmatter:
+  name: example-writing-style
+  description: Write plainly and directly. Short sentences, active voice, no filler.
+  context: null
+body: |
+  # Example Writing Style
+
+  Write plainly and directly.
+
+  - Prefer short sentences.
+  - Use active voice.
+  - Cut filler words and hedging.
+  - Lead with the conclusion, then support it.
+
+  This body is placeholder content shipped for schema and generator validation.
+applies_when: Any drafting or editing task where a plain, direct register is wanted.
+created_at: 2026-01-01T00:00:00Z
+updated_at: 2026-01-01T00:00:00Z
