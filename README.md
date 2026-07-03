@@ -127,6 +127,13 @@ external artifacts (systemd units, dashboards, git history) resolve those
 from configurable paths and skip cleanly when they are absent — the normal
 state of a fresh checkout.
 
+## Related
+
+[operator-kernel](https://github.com/ecpunk/operator-kernel) is the
+execution-side complement: a runtime that carries out changes under the same
+philosophy — explicit approval, bounded actions, proof output — using a
+control plane like this one as its source of trusted context.
+
 ## Status
 
 Working today: the canonical store with full schema, vocabulary, and
