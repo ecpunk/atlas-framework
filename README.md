@@ -1,9 +1,5 @@
 # Atlas
 
-> **DRAFT** — this README describes the framework accurately but the prose is a
-> skeleton awaiting a final editorial pass. Structure, commands, and the worked
-> example are correct; wording will be tightened.
-
 Atlas is a canonical, agent-facing control plane for the systems you operate.
 Agents, operators, automations, and dashboards read state, propose changes, and
 act through a single typed surface — governed by rules, validated against
@@ -15,6 +11,10 @@ plus a small set of **fictional example entities** (a `hydra` server, an
 `example-web-app` service, and the `atlas` project that owns the control plane
 itself) so the framework demonstrates itself out of the box. It ships with no
 operator-personal data; the entity directories are yours to fill.
+
+It was not designed on a whiteboard. It was extracted from a control plane that
+has governed a real, agent-operated environment in production — the example
+entities are fictional; the patterns are not.
 
 ## The Problem Atlas Solves
 
