@@ -1,88 +1,80 @@
 # Atlas
 
-Atlas is a system of record for the stuff you run — servers, services,
-projects, and the rules for operating them — built so that both people and AI
-agents work from the same facts.
+Atlas is the coordination layer for an environment operated by both humans
+and AI agents: a single, schema-validated record of what exists, what work is
+in flight, and what each actor is permitted to do — with every human-facing
+view generated from it rather than maintained by hand.
 
-Every fact lives in exactly one place, as a small YAML file with a schema
-behind it. Everything you'd normally maintain by hand — the service catalog,
-the project index, status reports — is generated from those files instead.
-And when an AI agent wants to know what exists or change something, it goes
-through the same interface with the same rules applied, instead of grepping
-around and guessing.
+Think of it as the control tower at a small airfield. The pilots — some
+human, some autonomous — never negotiate with each other directly. Every one
+of them flies against the tower's picture of the field, requests clearance
+before acting, and how much each may do without asking depends on who they
+are and how risky the maneuver is. Everything that moves is logged. Atlas is
+that tower, for an environment where AI agents do real work.
 
-This repo is the framework itself: the schemas, the generators, the rule
-engine, the drift checker, and the MCP server. It ships with a small set of
-made-up example entities (a server named `hydra`, a demo web app) so you can
-run everything immediately, then swap in your own. There's no personal data
-here — but the framework wasn't invented for this repo either. It was pulled
-out of a real system that has been running an agent-operated homelab in
-production; the examples are fictional, the patterns are not.
+This repository is the framework: the schemas, the vocabularies, the
+generation pipeline, the rule engine, the drift tooling, and the MCP server
+that agents connect to. It ships with a small set of fictional example
+entities (a server named `hydra`, a demo web application) so everything runs
+out of the box, and contains no operator-personal data. The framework itself
+was not invented for this repository — it was extracted from a production
+system that governs a real, agent-operated environment every day. The
+examples are fictional; the patterns are not.
 
 ## Why this exists
 
-If you run more than a handful of services, you already have this problem:
-the truth about your system is scattered. Some of it is in config files, some
-in a wiki page from last year, some in your head. Ask "what's actually
-running, and what rules apply to it?" and you get a different answer from
-every source.
+An AI agent with shell access can do almost anything. What it cannot do, on
+its own, is know whether an action is correct for your environment,
+consistent with decisions already made, or something you explicitly ruled out
+last month. That knowledge has to live somewhere, and in most environments it
+is scattered — some in config files, some in a wiki, some in the operator's
+head. Every consumer gets a different answer, and an agent acting on the
+wrong one is indistinguishable from a helpful agent right up until it isn't.
 
-That's annoying for humans. For AI agents it's dangerous. An agent with shell
-access can do almost anything — what it *can't* do is know whether an action
-is right for your system, or whether it's about to repeat a mistake you
-already fixed once. Without a source of truth to check against, "helpful"
-and "destructive" look identical.
+Atlas gives that knowledge one home. In production use it earns its keep in
+three distinct roles, and the framework in this repository implements all
+three.
 
-Atlas is that source of truth. Write each fact down once, let everything else
-be generated, and give agents the same governed door humans use.
+**Shared memory.** The store records not just infrastructure — servers,
+services, projects — but work: tasks and sessions are entities too. Agents
+log what they did, pick up what's open, and build on each other's context
+instead of rediscovering it. In practice this is the highest-traffic part of
+the system: the store functions as the ledger through which humans and agents
+coordinate.
 
-## The four pieces
+**Permission system.** Consumer profiles declare what each actor — the
+operator at a terminal, an attended chat agent, an unattended automation — is
+entitled to do, expressed against a shared vocabulary of action tiers
+(`read_only`, `reversible`, `new_surface`, `irreversible`). Every surface
+asks the same question and gets the same verdict: allow, confirm, or deny.
+Rules are entities as well, so tightening policy is a YAML change, not a
+deploy.
 
-**The store.** Plain YAML files, one per entity — a service, a server, a
-project, a rule. Schemas keep the shape right; vocabularies keep the values
-right (you can't set a service's lifecycle to a made-up word). Nothing is
-copy-pasted into a second location, ever.
+**View generator.** Everything a human reads — service catalogs, project
+indexes, dashboards, status rollups — is generated from the store by a
+pipeline of small generators. No view is ever edited by hand. If a report is
+wrong, an entity or a generator is wrong, and you fix the cause.
 
-**The generators.** Scripts that read the store and write the human-facing
-views: catalogs, indexes, reports. You never edit the output. If a report is
-wrong, either an entity or a generator is wrong, and you fix that instead.
+A fourth piece keeps the record honest: a scheduled **drift checker**
+compares what the store says should be true against what is actually true on
+the machines, classifies each gap, and routes it — remediate automatically,
+propose to the operator, or flag for review.
 
-**The rules.** Rules are just entities too — YAML files saying things like
-"every service must name its backup plan." They're checked when entities are
-validated and when views are generated. Adding a rule is a one-file change,
-and it catches bad edits whether a human or an agent made them.
+## How it's built
 
-**The drift checker.** A scheduled job that compares what the store *says*
-should be true against what's *actually* true on the machines, then sorts the
-differences: fix automatically, propose to the operator, or flag for review.
+Entities are plain YAML files, one per fact, validated against Pydantic
+schemas and canonical vocabularies — a service cannot declare a lifecycle
+value that doesn't exist. Generators read the store and emit views;
+extensions add operator-specific generators without touching core. Rules are
+checked at validation time and again at generation time. The MCP server
+exposes the whole surface — reads, proposals, checks — to any MCP-capable
+agent runtime.
 
-```text
-        people, agents, dashboards, automations
-                        |
-                 one shared interface
-                 (Atlas MCP server)
-                        |
-        +---------------+---------------+
-        |               |               |
-     the store  -->  generators  -->  views
-    (YAML files)                  (catalogs, reports)
-        ^                               
-        |          rules check every    
-   drift checker   edit and every run   
-   (says vs. is)                        
-```
-
-## Agents don't get a side door
-
-The design rule that matters most: Atlas doesn't care who's asking. A person
-at a terminal, an agent in a chat session, and a cron job all hit the same
-interface, and the same rules apply to all of them.
-
-Writes work on a propose-then-confirm basis — a change is previewed before it
-lands, so an agent can't silently rewrite the record. Actions are tiered
-(read-only, reversible, new-surface, irreversible), and per-consumer profiles
-decide what each caller may do unattended. The validation that catches your
-typo catches the agent's hallucination too.
+Writes follow a propose-then-confirm contract: a mutation is previewed before
+it is applied, so an agent cannot silently rewrite the record. The same
+schemas, the same rules, and the same confirmation gates apply to every
+caller. There is no privileged path for humans and no weakened one for
+agents — which is precisely what makes it safe to let agents in at all.
 
 ## Try it
 
@@ -92,10 +84,10 @@ cd atlas-framework
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 
-# Check the example entities against schemas, vocabularies, and rules
+# Validate the example entities against schemas, vocabularies, and rules
 .venv/bin/python tools/validate.py
 
-# See what generators exist, then preview them all against the examples
+# List the generators, then preview the full pipeline against the examples
 .venv/bin/python tools/pipeline.py --list
 .venv/bin/python tools/pipeline.py --dry-run
 
@@ -106,38 +98,39 @@ python3 -m venv .venv
 .venv/bin/python tools/mcp_server.py
 ```
 
-That validates and generates against the fictional example tree out of the
-box. To make it yours, replace the files under `entities/` with your own.
+This validates and generates against the fictional example tree out of the
+box. To make it yours, replace the entities under `entities/` with your own.
 
-A few generators can call an LLM for summarization; those are off unless you
-pass `--allow-llm`, so you can't spend money by accident. `tools/pipeline.py
---help` shows the full set of flags.
+A few generators can call an LLM for summarization; these are disabled unless
+you pass `--allow-llm`, so nothing spends money by accident. Run
+`tools/pipeline.py --help` for the full flag surface.
 
-## What's where
+## Repository layout
 
 - `schemas/` — the shape each entity type must have
-- `vocabularies/` — the allowed values (lifecycles, categories, tiers)
-- `entities/` — the facts themselves; ships with fictional examples only
+- `vocabularies/` — the allowed values (lifecycles, categories, action tiers)
+- `entities/` — the canonical records; ships with fictional examples only
 - `generators/` — store in, human-readable views out
-- `extensions/` — your own generators, auto-discovered per directory
+- `extensions/` — operator-specific generators, auto-discovered per directory
   (`extensions/hydra/` is a worked example)
-- `rules/` — pipeline policy configs
-- `tools/` — validate, generate, drift-check, MCP server
-- `docs/` — guides for writing entities
+- `rules/` — pipeline policy configuration
+- `tools/` — validation, pipeline, drift and remediation, MCP server
+- `docs/` — entity authoring guides
 - `outputs/` — generated views land here (gitignored)
 
 ## Configuration
 
-Secrets come from environment variables, with a gitignored `secrets/`
-directory as the file-based fallback — nothing sensitive is committed, and
-`.env.example` lists what's expected. Tools that compare against external
-things (systemd units, dashboards, git history) take their paths from config
-and skip cleanly when those things don't exist, which is the normal state of
-a fresh checkout.
+Secrets are read from environment variables, with a gitignored `secrets/`
+directory as the file-based fallback; nothing sensitive is committed, and
+`.env.example` documents what is expected. Tools that reconcile against
+external artifacts (systemd units, dashboards, git history) resolve those
+from configurable paths and skip cleanly when they are absent — the normal
+state of a fresh checkout.
 
 ## Status
 
-Working today: the store with full validation, the generator pipeline, the
-rule engine, and the MCP server with propose-confirm writes. The drift
-checker runs on a schedule; richer provenance on its findings and tuning of
-its escalation thresholds are still in progress.
+Working today: the canonical store with full schema, vocabulary, and
+reference validation; the generation pipeline; the rule engine; consumer
+profiles and action tiers; and the MCP server with propose-confirm writes.
+The drift checker runs on a schedule; richer provenance on its findings and
+tuning of its escalation thresholds are in progress.
