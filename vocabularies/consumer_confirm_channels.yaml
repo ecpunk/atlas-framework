@@ -1,0 +1,43 @@
+id: consumer_confirm_channels
+name: Consumer Confirm Channels
+description: |
+  Confirmation transport options for confirm-first actions in consumer profiles.
+purpose: |
+  Decouples confirm UX from code so each consumer can enforce explicit approval
+  through its native interaction channel.
+values:
+  - id: telegram_inline_keyboard
+    name: Telegram Inline Keyboard
+    description: Telegram button-based confirm/cancel control.
+    semantics: |
+      Confirm-first actions require explicit button or token confirmation.
+    physical_location: null
+    deprecated: false
+    deprecated_reason: null
+  - id: claude_ios_message
+    name: Claude iOS Message
+    description: Conversational approval in Claude iOS channel.
+    semantics: |
+      Action remains staged until explicit approve instruction is received.
+    physical_location: null
+    deprecated: false
+    deprecated_reason: null
+  - id: copilot_blocking_return
+    name: Copilot Blocking Return
+    description: Desktop interactive approval gate in Copilot workflow.
+    semantics: |
+      Plan/result is returned in blocking flow before execution continuation.
+    physical_location: null
+    deprecated: false
+    deprecated_reason: null
+  - id: none
+    name: None
+    description: No confirmation transport.
+    semantics: |
+      Intended only for read-only consumers.
+    physical_location: null
+    deprecated: false
+    deprecated_reason: null
+extension_policy: open
+created_at: 2026-05-16T00:00:00Z
+updated_at: 2026-05-16T00:00:00Z

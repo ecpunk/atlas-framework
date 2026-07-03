@@ -1,0 +1,42 @@
+id: consumer_response_shapes
+name: Consumer Response Shapes
+description: |
+  Canonical response-shape values for consumer-profile output contracts.
+purpose: |
+  Ensures response formatting policy is explicit and auditable per consumer.
+values:
+  - id: one_line_summary
+    name: One Line Summary
+    description: Minimal concise response.
+    semantics: |
+      Prioritizes speed and brevity for mobile operator surfaces.
+    physical_location: null
+    deprecated: false
+    deprecated_reason: null
+  - id: structured_findings_with_reasoning
+    name: Structured Findings With Reasoning
+    description: Evidence-forward structured output with rationale.
+    semantics: |
+      Includes findings and reasoning for operator review workflows.
+    physical_location: null
+    deprecated: false
+    deprecated_reason: null
+  - id: full_plan_with_diff
+    name: Full Plan With Diff
+    description: Detailed execution plan including code/config deltas.
+    semantics: |
+      Optimized for desktop execution review and approval.
+    physical_location: null
+    deprecated: false
+    deprecated_reason: null
+  - id: alert_payload
+    name: Alert Payload
+    description: Alert-centric machine-friendly response body.
+    semantics: |
+      Used for monitoring signal consumers and notification fan-out.
+    physical_location: null
+    deprecated: false
+    deprecated_reason: null
+extension_policy: open
+created_at: 2026-05-16T00:00:00Z
+updated_at: 2026-05-16T00:00:00Z

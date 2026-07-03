@@ -1,0 +1,53 @@
+id: memory_types
+name: Memory Types
+description: |
+  Functional types for consolidated memories promoted from the Substrate
+  episodic floor into Atlas by the consolidation loop.
+purpose: |
+  Projects a stabilized episodic pattern into the functional form the moment
+  needs — the same insight as Substrate's single-store-many-projections model,
+  one zoom level out. See the consolidation design notes.
+values:
+  - id: identity
+    name: Identity
+    description: Who the operator is — role, context, durable facts about the person.
+    semantics: |
+      Stable self-facts ("the operator founded Example Co"; "operates a Hydra homelab").
+    physical_location: null
+    deprecated: false
+    deprecated_reason: null
+  - id: preference
+    name: Preference
+    description: How the operator likes things done — style, tone, defaults, workflow.
+    semantics: |
+      Recurring stated or demonstrated preferences ("answer-first, expand on request").
+    physical_location: null
+    deprecated: false
+    deprecated_reason: null
+  - id: expertise
+    name: Expertise
+    description: What the operator knows — domains of knowledge and demonstrated skill.
+    semantics: |
+      Areas of competence inferred from recurring fluent discussion.
+    physical_location: null
+    deprecated: false
+    deprecated_reason: null
+  - id: decision
+    name: Decision
+    description: What the operator decided and why — rationale, precedent, direction.
+    semantics: |
+      A settled choice with its reasoning; reversible by a later superseding memory.
+    physical_location: null
+    deprecated: false
+    deprecated_reason: null
+  - id: reference
+    name: Reference
+    description: A durable pointer — to a resource, pattern, or external fact.
+    semantics: |
+      Stable referential knowledge worth recalling verbatim.
+    physical_location: null
+    deprecated: false
+    deprecated_reason: null
+extension_policy: open
+created_at: 2026-06-03T00:00:00Z
+updated_at: 2026-06-03T00:00:00Z

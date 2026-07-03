@@ -1,0 +1,43 @@
+id: consumer_input_modalities
+name: Consumer Input Modalities
+description: |
+  Input shape categories for unified-agent consumer profiles.
+purpose: |
+  Constrains how inbound requests are interpreted and which schema paths apply
+  during intent submission and explainability rendering.
+values:
+  - id: natural_language
+    name: Natural Language
+    description: Freeform text from an operator-facing interface.
+    semantics: |
+      Request requires parsing/routing and explainability context.
+    physical_location: null
+    deprecated: false
+    deprecated_reason: null
+  - id: structured_intent
+    name: Structured Intent
+    description: Intent arrives as structured fields rather than free text.
+    semantics: |
+      Routing can skip NL extraction and evaluate direct intent payload.
+    physical_location: null
+    deprecated: false
+    deprecated_reason: null
+  - id: signal_payload
+    name: Signal Payload
+    description: Internal monitoring signal/event input.
+    semantics: |
+      Non-interactive ingest path, usually read-only and alert-focused.
+    physical_location: null
+    deprecated: false
+    deprecated_reason: null
+  - id: slash_command
+    name: Slash Command
+    description: Command-style terse input with optional arguments.
+    semantics: |
+      Deterministic command surface with constrained parser semantics.
+    physical_location: null
+    deprecated: false
+    deprecated_reason: null
+extension_policy: open
+created_at: 2026-05-16T00:00:00Z
+updated_at: 2026-05-16T00:00:00Z

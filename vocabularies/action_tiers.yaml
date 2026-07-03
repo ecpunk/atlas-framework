@@ -1,0 +1,43 @@
+id: action_tiers
+name: Action Tiers
+description: |
+  Canonical action-tier classification values for unified-agent policy dispatch.
+purpose: |
+  Normalizes tier names across consumer profiles, classification rules, and
+  runtime gating behavior.
+values:
+  - id: read_only
+    name: Read Only
+    description: No mutation side effects.
+    semantics: |
+      Query and inspection operations only.
+    physical_location: null
+    deprecated: false
+    deprecated_reason: null
+  - id: reversible
+    name: Reversible
+    description: Mutation with bounded rollback path.
+    semantics: |
+      Requires confirm policy per profile before execution.
+    physical_location: null
+    deprecated: false
+    deprecated_reason: null
+  - id: new_surface
+    name: New Surface
+    description: Creates or exposes new operational surface area.
+    semantics: |
+      Always confirm-first regardless of profile autopilot settings.
+    physical_location: null
+    deprecated: false
+    deprecated_reason: null
+  - id: irreversible
+    name: Irreversible
+    description: Destructive or non-recoverable operation class.
+    semantics: |
+      Confirm-first always and never autopilot eligible.
+    physical_location: null
+    deprecated: false
+    deprecated_reason: null
+extension_policy: open
+created_at: 2026-05-16T00:00:00Z
+updated_at: 2026-05-16T00:00:00Z

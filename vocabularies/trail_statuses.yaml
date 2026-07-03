@@ -1,0 +1,44 @@
+id: trail_statuses
+name: Trail Statuses
+description: |
+  Lifecycle states for "trails" — exploratory leads (noticed adjacencies between
+  ideas) surfaced by the consolidation loop.
+purpose: |
+  Tracks a lead from first notice through a demand-gated pull to its resolution.
+  See the consolidation design notes.
+values:
+  - id: open
+    name: Open
+    description: A noticed adjacency not yet pulled.
+    semantics: |
+      Surfaced but inert; awaits the operator (or the cortex) choosing to pull it.
+    physical_location: null
+    deprecated: false
+    deprecated_reason: null
+  - id: pulled
+    name: Pulled
+    description: Actively being explored after a demand-gated pull.
+    semantics: |
+      A focused look at the adjacency is underway (bounded recursion).
+    physical_location: null
+    deprecated: false
+    deprecated_reason: null
+  - id: led-somewhere
+    name: Led Somewhere
+    description: The pull produced something — a memory, project, or new trail.
+    semantics: |
+      Resolved productively; provenance links to what it yielded.
+    physical_location: null
+    deprecated: false
+    deprecated_reason: null
+  - id: dead
+    name: Dead
+    description: Pulled and found to lead nowhere; closed.
+    semantics: |
+      Resolved unproductively; retained so it is not re-proposed.
+    physical_location: null
+    deprecated: false
+    deprecated_reason: null
+extension_policy: open
+created_at: 2026-06-03T00:00:00Z
+updated_at: 2026-06-03T00:00:00Z

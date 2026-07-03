@@ -1,0 +1,42 @@
+id: session_entity_profiles
+name: Session Entity Profiles
+description: |
+  Session-record schema profile identifiers used by consumer profiles.
+purpose: |
+  Maps each consumer to the intended session density and field shape.
+values:
+  - id: lightweight
+    name: Lightweight
+    description: Minimal interaction trace for quick operator surfaces.
+    semantics: |
+      Captures essential metadata, status, and tool calls.
+    physical_location: null
+    deprecated: false
+    deprecated_reason: null
+  - id: alert_focused
+    name: Alert Focused
+    description: Session profile for signal ingest and alert routing.
+    semantics: |
+      Emphasizes signal metadata and remediation references.
+    physical_location: null
+    deprecated: false
+    deprecated_reason: null
+  - id: execution_focused
+    name: Execution Focused
+    description: Session profile for implementation-heavy desktop workflows.
+    semantics: |
+      Captures plan/approval/execution checkpoints and action provenance.
+    physical_location: null
+    deprecated: false
+    deprecated_reason: null
+  - id: full_conversational
+    name: Full Conversational
+    description: Rich session profile for conversational reasoning surfaces.
+    semantics: |
+      Preserves rationale-oriented interaction metadata and alternatives.
+    physical_location: null
+    deprecated: false
+    deprecated_reason: null
+extension_policy: open
+created_at: 2026-05-16T00:00:00Z
+updated_at: 2026-05-16T00:00:00Z

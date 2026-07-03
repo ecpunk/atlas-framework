@@ -1,0 +1,42 @@
+id: consumer_auth_principal_schemes
+name: Consumer Auth Principal Schemes
+description: |
+  Allowed scheme prefixes for consumer_profile.auth_principal typed strings.
+purpose: |
+  Provides deterministic validation of principal format and source trust model.
+values:
+  - id: telegram-user-id
+    name: Telegram User ID
+    description: Telegram numeric user identifier.
+    semantics: |
+      Single-user allowlist principal for Telegram operator surface.
+    physical_location: null
+    deprecated: false
+    deprecated_reason: null
+  - id: anthropic-oauth-subject
+    name: Anthropic OAuth Subject
+    description: OAuth subject string from Anthropic-authenticated surface.
+    semantics: |
+      Binds Claude iOS requests to an operator identity principal.
+    physical_location: null
+    deprecated: false
+    deprecated_reason: null
+  - id: desktop-session
+    name: Desktop Session
+    description: Local desktop session principal.
+    semantics: |
+      Constrains actions to authenticated local desktop workflow context.
+    physical_location: null
+    deprecated: false
+    deprecated_reason: null
+  - id: internal-hydra-alert-pipeline
+    name: Internal Hydra Alert Pipeline
+    description: Internal non-human monitoring pipeline principal.
+    semantics: |
+      Used for signal ingest profile with read-only authority.
+    physical_location: null
+    deprecated: false
+    deprecated_reason: null
+extension_policy: open
+created_at: 2026-05-16T00:00:00Z
+updated_at: 2026-05-16T00:00:00Z
