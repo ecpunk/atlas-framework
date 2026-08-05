@@ -46,9 +46,18 @@ check_unit() {
 check_unit atlas-mcp
 check_unit atlas-session-retention.timer
 
+# The server may still be binding right after phase 50's enable --now —
+# give it up to ~20s before judging. curl's non-zero exit on connection
+# refused must not kill the script under set -e, hence the `|| true`.
 mcp_body_file="$(mktemp)"
-code="$(curl -s -o "$mcp_body_file" -w '%{http_code}' "http://127.0.0.1:${PORT}/mcp")"
-payload="$(cat "$mcp_body_file")"
+code=""
+payload=""
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  code="$(curl -s -o "$mcp_body_file" -w '%{http_code}' "http://127.0.0.1:${PORT}/mcp" || true)"
+  payload="$(cat "$mcp_body_file")"
+  [ "$code" = "406" ] && break
+  sleep 2
+done
 rm -f "$mcp_body_file"
 if [ "$code" = "406" ] && printf '%s' "$payload" | grep -q "text/event-stream"; then
   echo "MCP_ENDPOINT_OK   GET /mcp -> 406 (text/event-stream required, as expected for a live streamable-http server)"

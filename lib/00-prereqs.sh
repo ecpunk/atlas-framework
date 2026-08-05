@@ -25,7 +25,12 @@ check_bin() {
 
 check_bin git git
 check_bin curl curl
-check_bin openssl openssl
+if command -v openssl >/dev/null 2>&1; then
+  printf 'FOUND %-8s %s\n' openssl "$(openssl version 2>&1 | head -n1)"
+else
+  printf 'MISSING %-8s (install with: sudo apt-get install -y openssl)\n' openssl
+  fail=1
+fi
 
 if command -v python3 >/dev/null 2>&1; then
   pyver="$(python3 -c 'import sys; print(".".join(map(str, sys.version_info[:3])))')"
