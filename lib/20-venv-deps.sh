@@ -14,9 +14,16 @@ banner "Creating venv + installing dependencies in $REPO_ROOT"
 cd "$REPO_ROOT"
 [ -f requirements.txt ] || die "no requirements.txt at $(pwd) — is this the engine repo root?"
 
-if [ -x .venv/bin/python3 ]; then
+# Reuse only a COMPLETE venv. A venv created while the distro's venv
+# package was missing exists but has no pip — trusting it strands the
+# install (seen on the Pi round). Rebuild anything without pip.
+if [ -x .venv/bin/python3 ] && [ -x .venv/bin/pip ]; then
   log ".venv already exists — reusing it"
 else
+  if [ -d .venv ]; then
+    log ".venv exists but is incomplete (no pip) — rebuilding it"
+    rm -rf .venv
+  fi
   python3 -m venv .venv
   log "created .venv"
 fi
