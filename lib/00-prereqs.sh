@@ -42,10 +42,26 @@ if command -v python3 >/dev/null 2>&1; then
     printf 'TOO OLD  python3  %s (need >= 3.10)\n' "$pyver"
     fail=1
   fi
-  if ! python3 -m venv --help >/dev/null 2>&1; then
-    printf 'MISSING  python3-venv module (install with: sudo apt-get install -y python3-venv)\n'
-    fail=1
+  # `python3 -m venv --help` succeeds even when the distro's venv package is
+  # missing (Ubuntu ships the module but not ensurepip) — the only honest
+  # check is actually creating one. Found the hard way on a fresh Raspberry
+  # Pi Ubuntu Server image. If it fails, install the package right here:
+  # bootstrap needs sudo later anyway, and a non-technical owner shouldn't
+  # be bounced out to run one apt command by hand.
+  venv_probe="$(mktemp -d)"
+  if python3 -m venv "$venv_probe/v" >/dev/null 2>&1; then
+    printf 'FOUND    python3-venv (venv creation works)\n'
+  else
+    printf 'MISSING  python3-venv — installing it now (sudo may prompt for your password)\n'
+    if sudo apt-get update -qq && sudo apt-get install -y -qq python3-venv \
+       && python3 -m venv "$venv_probe/v" >/dev/null 2>&1; then
+      printf 'FOUND    python3-venv (just installed)\n'
+    else
+      printf 'STILL MISSING  python3-venv (tried: sudo apt-get install -y python3-venv)\n'
+      fail=1
+    fi
   fi
+  rm -rf "$venv_probe"
 else
   printf 'MISSING  python3  (install with: sudo apt-get install -y python3 python3-venv)\n'
   fail=1
