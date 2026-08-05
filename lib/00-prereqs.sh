@@ -53,10 +53,13 @@ if command -v python3 >/dev/null 2>&1; then
     printf 'FOUND    python3-venv (venv creation works)\n'
   else
     printf 'MISSING  python3-venv — installing it now (sudo may prompt for your password)\n'
-    # A freshly-installed box runs unattended-upgrades on first boot, which
-    # holds the apt lock for several minutes. Wait for it instead of failing.
-    printf '         (if the system is still running its first-boot updates, this waits for them — up to 10 minutes)\n'
-    APT_WAIT='-o DPkg::Lock::Timeout=600'
+    # A freshly-installed box runs unattended-upgrades on first boot, and
+    # that can mean upgrading the whole OS (kernel included) — observed 30+
+    # minutes on a Raspberry Pi writing to an SD card. Wait it out rather
+    # than failing; re-running later is always safe.
+    printf '         (a freshly-installed system updates itself on first boot — on a small machine\n'
+    printf '          this can take up to half an hour; waiting for it rather than failing)\n'
+    APT_WAIT='-o DPkg::Lock::Timeout=1800'
     if sudo apt-get $APT_WAIT update -qq && sudo apt-get $APT_WAIT install -y -qq python3-venv \
        && python3 -m venv "$venv_probe/v" >/dev/null 2>&1; then
       printf 'FOUND    python3-venv (just installed)\n'
