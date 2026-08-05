@@ -17,7 +17,8 @@ import re
 import subprocess
 import sys
 import tempfile
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -31,13 +32,13 @@ from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel
 
 from tools.atlas_lock import atlas_write_lock
-from tools.llm_client import freeform_respond, get_llm_runtime_info, route_telegram_intent
-from tools.store import Store, load_store
+from tools.refs import build_ref_index, check_refs
+from tools.store import Store, load_store, _schema_for_entity_dir
 
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8105
 DEFAULT_MCP_PATH = "/mcp"
-DEFAULT_API_KEY_FILE = REPO_ROOT / "secrets" / "api_key.txt"
+DEFAULT_API_KEY_FILE = REPO_ROOT / ".secrets" / "api_key.txt"
 
 _store: Store | None = None
 
@@ -71,27 +72,6 @@ def _parse_iso_or_none(value: Any) -> datetime | None:
         return parsed.astimezone(timezone.utc)
     except ValueError:
         return None
-
-
-def _clamp(value: float, min_value: float, max_value: float) -> float:
-    return max(min_value, min(max_value, value))
-
-
-def _quantile(values: list[float], q: float) -> float:
-    if not values:
-        return 0.0
-    if q <= 0:
-        return float(min(values))
-    if q >= 1:
-        return float(max(values))
-    ordered = sorted(float(v) for v in values)
-    if len(ordered) == 1:
-        return ordered[0]
-    pos = q * (len(ordered) - 1)
-    low = int(pos)
-    high = min(low + 1, len(ordered) - 1)
-    frac = pos - low
-    return ordered[low] * (1.0 - frac) + ordered[high] * frac
 
 
 def _validate_domain_tags(domain_tags: list[str] | None) -> list[str] | None:
@@ -221,15 +201,71 @@ def _git_commit(rel_path: str | list[str], message: str) -> dict[str, Any]:
             text=True,
             timeout=15,
             env={**os.environ, "GIT_AUTHOR_NAME": "atlas-mcp", "GIT_COMMITTER_NAME": "atlas-mcp",
-                 "GIT_AUTHOR_EMAIL": "atlas@example.local", "GIT_COMMITTER_EMAIL": "atlas@example.local"},
+                 "GIT_AUTHOR_EMAIL": "atlas-mcp@atlas-instance.local", "GIT_COMMITTER_EMAIL": "atlas-mcp@atlas-instance.local"},
         )
         if commit.returncode != 0:
             return {"error": f"git commit failed: {commit.stderr.strip() or commit.stdout.strip()}"}
         return {"ok": True, "sha": commit.stdout.strip().split()[-1] if commit.stdout.strip() else ""}
 
 
-def _write_and_commit(entity_dir: str, entity_id: str, data: dict[str, Any], message: str) -> dict[str, Any]:
-    """Write entity YAML and commit. Validates schema via load_store after write.
+@dataclass
+class EntityCheck:
+    """Outcome of pre-write validation. errors block the write; warnings ride along."""
+
+    errors: list[str]
+    warnings: list[str]
+
+
+def _validate_entity(entity_dir: str, entity_id: str, data: dict[str, Any]) -> EntityCheck:
+    """Validate a candidate entity dict BEFORE anything is written to disk.
+
+    Two layers:
+      1. Schema — resolve entity_dir to its pydantic model and model_validate(data).
+      2. References — resolve every VocabRef against the loaded vocabularies and every
+         TypedRef against the loaded entity ids (tools/refs.py, shared with validate.py).
+
+    VocabRef misses are errors, TypedRef misses are warnings — see tools/refs.py for
+    why. Returns EntityCheck([], [...]) when the entity is safe to write.
+    """
+    validator = _schema_for_entity_dir(entity_dir)
+    if validator is None:
+        return EntityCheck([f"no schema module for entities/{entity_dir}/"], [])
+
+    try:
+        model = validator(data)
+    except Exception as exc:
+        return EntityCheck([f"schema validation failed: {exc}"], [])
+
+    try:
+        store = _get_store()
+    except Exception as exc:
+        # The store itself is unloadable (a pre-existing bad entity). Don't let that
+        # block an otherwise-valid write — the schema layer above already passed.
+        return EntityCheck([], [f"reference check skipped — store failed to load: {exc}"])
+
+    entity_refs, vocab_values = build_ref_index(store)
+    kind = entity_dir[:-1] if entity_dir.endswith("s") else entity_dir
+    errors, warnings = check_refs(
+        model, entity_refs, vocab_values, self_ref=f"{kind}:{entity_id}"
+    )
+    return EntityCheck(errors, warnings)
+
+
+def _write_and_commit(
+    entity_dir: str,
+    entity_id: str,
+    data: dict[str, Any],
+    message: str,
+    *,
+    skip_validation: bool = False,
+) -> dict[str, Any]:
+    """Validate, then write entity YAML and commit.
+
+    Validation runs BEFORE the file is touched. It used to run after the commit, which
+    meant an invalid entity was already in git and had already fired the post-commit
+    regeneration hook — and because load_store() validates the *whole* store, one bad
+    write made every subsequent read tool raise until a human hand-fixed the YAML. A
+    failed validation is now a strict no-op: nothing written, nothing staged, tree clean.
 
     Promotion cleanup: if a staging stub (staging/<entity_id>.yaml) exists for this
     id, it is removed in the same commit. staging/ is a transient operator-review
@@ -238,6 +274,17 @@ def _write_and_commit(entity_dir: str, entity_id: str, data: dict[str, Any], mes
     remediate.py's unlink pattern; also opportunistically retires any pre-existing
     stale stub whose id is written here.
     """
+    check = EntityCheck([], [])
+    if not skip_validation:
+        check = _validate_entity(entity_dir, entity_id, data)
+        if check.errors:
+            return {
+                "error": "validation failed — nothing written or committed",
+                "entity": f"{entity_dir}/{entity_id}",
+                "errors": check.errors,
+                "hint": "Call list_vocabularies() to see the legal value_ids for every vocabulary.",
+            }
+
     rel_path = f"entities/{entity_dir}/{entity_id}.yaml"
     abs_path = REPO_ROOT / rel_path
     abs_path.parent.mkdir(parents=True, exist_ok=True)
@@ -252,11 +299,8 @@ def _write_and_commit(entity_dir: str, entity_id: str, data: dict[str, Any], mes
 
     result = _git_commit(commit_paths, message)
     _invalidate_store()
-    # Trigger pipeline post-commit hook validation
-    try:
-        _get_store()
-    except Exception as exc:
-        return {"error": f"Entity written and committed but schema validation failed: {exc}"}
+    if check.warnings:
+        result["warnings"] = check.warnings
     return result
 
 
@@ -332,7 +376,7 @@ def _extract_tool_name(body: bytes) -> str:
     return ""
 
 
-MCP_INSTRUCTIONS = """You are connected to the Atlas canonical entity store for the Hydra homelab.
+MCP_INSTRUCTIONS = """You are connected to an Atlas canonical entity store.
 
 Atlas is the single source of truth for stack definitions: projects, services, servers, agents, rules, and vocabularies.
 
@@ -344,16 +388,15 @@ Read tools:
 - get_server(id): server entity
 - get_vocabulary(id): vocabulary with all values
 - get_rule(id) / list_rules(scope?, severity?): rule entities
-- get_agent(id) / list_agents(): agent definitions
+- get_publication(id) / list_publications(): published repos/docs + their publication contract (drift-checked)
 - stack_summary(): entity counts — use this for orientation
 
 Bridge / output tools:
-- get_output(name): read a generated output file from atlas-store/outputs/ (e.g. "Service Catalog.md")
-- get_kb_doc(name): read a knowledge base doc from services/docs/kb/ (e.g. "Start Here.md")
-- create_kb_doc(path, content, confirm?, commit?): create docs/kb markdown via Atlas (single sanctioned write path)
-- update_kb_doc(path, content, confirm?, commit?): update docs/kb markdown via Atlas (single sanctioned write path)
+- get_kb_doc(name): read a knowledge base doc from the configured KB doc root (e.g. "Start Here.md")
+- create_kb_doc(path, content, confirm?, commit?): create docs/kb markdown via Atlas (single sanctioned write path; degenerate payloads — empty, unexpanded $(...) substitutions, __PLACEHOLDER__ tokens — are refused)
+- update_kb_doc(path, content, confirm?, commit?, allow_shrink?): update docs/kb markdown via Atlas (single sanctioned write path; FULL-FILE overwrite — degenerate payloads are refused, and content far smaller than the existing doc is refused unless allow_shrink=True)
 - append_kb_doc(path, content, expected_hash?, confirm?, commit?): append text to a KB doc server-side (no full-file round-trip; truncation-safe)
-- replace_kb_section(path, anchor, content, create_missing?, expected_hash?, confirm?, commit?): replace one markdown section's body by heading anchor, leaving the rest intact
+- replace_kb_section(path, anchor, content, create_missing?, expected_hash?, confirm?, commit?, allow_whole_file?): replace one markdown section's body by heading anchor, leaving the rest intact (H1 anchors that span the whole doc are refused unless allow_whole_file=True)
 - check_drift(service_id?, force?): reality probes — reads cached result by default; force=True runs live
 
 Write tools (propose-confirm pattern — preview first, then confirm=True to apply):
@@ -362,8 +405,12 @@ Write tools (propose-confirm pattern — preview first, then confirm=True to app
 - add_service(id, name, summary, service_type, lifecycle, deployment_path, ...): add new service (autonomous)
 - update_service(id, confirm?, lifecycle?, port?, ...): update service fields
 - retire_service(id, confirm?): set service lifecycle to retired
+- set_maintenance(id, hours, reason, confirm?): declare a maintenance window (until = now+hours); while active, probes pass and restart-lock lifts for this service (Gate 1.1 — state-derived authority)
+- clear_maintenance(id, confirm?): end a declared maintenance window early
 - add_task(project, title, next_action, closure_test, ...): add canonical task (autonomous)
 - update_task(id, confirm?, status?, priority?, ...): update task fields
+- talos_queue_build(goal, repo, closure_test, constraints?, title?): queue an autonomous build for Talos (dictate-to-build watcher on project 'talos'); autonomous
+- talos_status / talos_list_builds / talos_cancel / talos_requeue: inspect and manage Talos build lifecycle (status+outcome, list, cancel a queued build, re-queue a finished/cancelled one)
 
 Task query tools:
 - get_task(id): read one task
@@ -374,21 +421,28 @@ Task query tools:
 Session query tools:
 - get_session(id): read one session
 - list_sessions(source?, status?, lifecycle?, user_id?, project_id?, limit?): list sessions with filters
-- session_touch_history(project_id?, source?, lifecycle?, since_hours?, limit?): recent sessions that touched projects
-- session_activity_summary(source?, since_hours?): aggregate session activity including off-hours ratio
-- session_activity_deltas(source?, current_hours?, baseline_hours?): week-over-week style trend deltas and anomaly prompts
-- session_operator_heatmap(source?, since_hours?, limit?): per-operator activity slices and service heatmap
-- session_baseline_alerts(source?, current_hours?, baseline_hours?, volume_delta_pct_threshold?, off_hours_delta_pp_threshold?, operator_spike_multiplier?): proactive baseline drift alerts
-- session_adaptive_thresholds(source?, current_hours?, history_hours?, quantile?, min_windows?): adaptive threshold profiles and alerts
 
-Session write tools:
-- add_session(user_id, ...): add canonical session entity (autonomous)
-- update_session(id, confirm?, status?, summary?, ...): update existing session entity
-- archive_session(id, confirm?, reason?): set lifecycle to archived with timestamp
-- prune_session(id, confirm?, reason?): remove transcript while preserving required audit metadata
+Memory query tools:
+- list_memories(memory_type?, status?, limit?): list consolidated memory entities, optionally filtered by memory_type (identity|preference|expertise|decision|reference) and status (active|superseded)
+- get_memory(id): read one consolidated memory entity in full
 
 Use stack_summary() first when you need an overview of what's in the store.
 """
+
+
+def _resolve_mcp_instructions() -> str:
+    """Base MCP_INSTRUCTIONS plus optional per-instance routing prose appended
+    from ATLAS_MCP_INSTRUCTIONS_EXTRA_FILE. Unset/missing/empty file = base only."""
+    base = MCP_INSTRUCTIONS
+    extra_path = os.environ.get("ATLAS_MCP_INSTRUCTIONS_EXTRA_FILE", "")
+    if extra_path:
+        p = Path(extra_path)
+        if p.is_file():
+            extra = p.read_text(encoding="utf-8").strip()
+            if extra:
+                return f"{base}\n\n{extra}"
+    return base
+
 
 # --- OAuth 2.1 (self-hosted authorization server) — env-gated, default OFF ---
 # When ATLAS_OAUTH_ENABLED is set, atlas-mcp becomes its own OAuth AS + resource
@@ -421,7 +475,7 @@ if _OAUTH_ENABLED:
 
 mcp = FastMCP(
     "AtlasMCP",
-    instructions=MCP_INSTRUCTIONS,
+    instructions=_resolve_mcp_instructions(),
     host=os.environ.get("ATLAS_MCP_HOST", DEFAULT_HOST),
     port=int(os.environ.get("ATLAS_MCP_PORT", str(DEFAULT_PORT))),
     streamable_http_path=os.environ.get("ATLAS_MCP_PATH", DEFAULT_MCP_PATH),
@@ -439,58 +493,206 @@ def stack_summary() -> dict[str, Any]:
     return summary
 
 
-@mcp.tool()
-def route_telegram_intent_tool(user_text: str, context_hint: str = "") -> dict[str, Any]:
-    """Route a Telegram ops message into a structured intent using the Atlas LLM policy gate.
+# ------------------------------------------------------------- demand log ---
+# The capability ledger measures SUPPLY: what exists, and whether it ran.
+# Nothing recorded DEMAND — what was asked for, and whether the stack could
+# answer. Without demand, a gap is only findable by a human reading 150 rows,
+# which is the manual audit this is meant to replace. Every ask appends one
+# line here; automations/scripts/capability_demand.py rolls it up.
+DEFAULT_DEMAND_LOG = "/opt/stack/services/automations/state/capability_asks.jsonl"
 
-    Returns JSON with intent, side_effect, confidence, action/container/service/lines, and model usage metadata.
+
+def _demand_log() -> Path:
+    """Resolved per call, not at import: tests point it at a fixture without
+    reloading the module, and reloading was silently returning the cached
+    module — every 'reloaded' assertion was checking the first import."""
+    return Path(os.environ.get("ATLAS_DEMAND_LOG", DEFAULT_DEMAND_LOG))
+
+ASK_OUTCOMES = {
+    "hit",    # something exists and is usable (a LIVE or IDLE match)
+    "stale",  # only DEAD/UNKNOWN matched — something exists, nothing usable
+    "miss",   # nothing matched at all
+    "built",  # the ask was answered by building the capability
+    "error",  # the lookup itself failed; NOT evidence about the stack
+}
+
+
+def _record_ask(query: str, outcome: str, source: str,
+                matched: list[str] | tuple[str, ...] = (), note: str = "") -> bool:
+    """Append one ask to the demand log.
+
+    Best-effort by design: a telemetry write must never fail the tool call it is
+    observing. A demand log that can take down find_capability would be worse
+    than no demand log.
     """
-    if not user_text.strip():
-        return {
-            "intent": "unknown",
-            "side_effect": "none",
-            "confidence": 0.0,
-            "action": "",
-            "container": "",
-            "service": "",
-            "lines": 50,
-            "reason": "empty input",
-            "error": True,
-            "cost_capped": False,
-        }
-    return route_telegram_intent(user_text=user_text, context_hint=context_hint)
+    record = {
+        "at": _now_iso(),
+        "query": " ".join(str(query or "").split())[:300],
+        "outcome": outcome if outcome in ASK_OUTCOMES else "error",
+        "source": source,
+        "top": matched[0] if matched else None,
+        "matched": list(matched)[:3],
+        "note": note[:200],
+    }
+    try:
+        log = _demand_log()
+        log.parent.mkdir(parents=True, exist_ok=True)
+        # One line, one write, O_APPEND: concurrent writers interleave records,
+        # never halves of a record.
+        with log.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return True
+    except Exception:
+        logging.getLogger(__name__).debug("demand log write failed", exc_info=True)
+        return False
 
 
 @mcp.tool()
-def freeform_respond_tool(user_text: str, context_hint: str = "") -> dict[str, Any]:
-    """Run a freeform agentic response using Sonnet + live MCP tool access.
+def record_capability_ask(query: str, outcome: str, capability_ids: str = "",
+                          note: str = "") -> dict[str, Any]:
+    """Record a capability ask that was answered WITHOUT calling find_capability.
 
-    Intended for Telegram messages that don't match a structured ops intent.
-    The agent has read-only access to: ops_server_status, ops_docker_status,
-    ops_service_logs (via hydra_ops_mcp) and atlas_stack_summary, atlas_list_services,
-    atlas_get_service, atlas_list_projects, atlas_get_project, atlas_check_drift,
-    atlas_session_activity_summary (internal).
+    The SessionStart digest deliberately removes the lookup round-trip, so most
+    asks now get answered straight from context and leave no trace. That is a
+    win for latency and a hole in the demand signal; this closes it.
 
-    Returns {"response": str, "model": str, "tokens_in": int, "tokens_out": int,
-             "tool_calls": int, "error": bool, "cost_capped": bool}.
+    Call this once per capability question you answer — "do we have something
+    for X", "what runs Y", or a request that turned out to need a build.
+
+      query           what was asked, in the asker's words
+      outcome         hit | stale | miss | built
+                        hit    a usable capability already existed
+                        stale  something exists but is DEAD/UNKNOWN/unusable
+                        miss   nothing exists for this
+                        built  the gap was closed by building it
+      capability_ids  comma-separated ids you pointed at, most relevant first
+      note            anything the query alone would not tell a later reader
     """
-    if not user_text.strip():
-        return {
-            "response": "No input provided.",
-            "model": "",
-            "tokens_in": 0,
-            "tokens_out": 0,
-            "tool_calls": 0,
-            "error": True,
-            "cost_capped": False,
-        }
-    return freeform_respond(user_text=user_text, context_hint=context_hint)
+    if outcome not in ASK_OUTCOMES:
+        return {"recorded": False,
+                "error": f"outcome must be one of {sorted(ASK_OUTCOMES - {'error'})}"}
+    ids = [i.strip() for i in (capability_ids or "").split(",") if i.strip()]
+    ok = _record_ask(query, outcome, source="agent", matched=ids, note=note)
+    return {"recorded": ok, "log": str(_demand_log()),
+            "note": None if ok else "demand log unwritable; the ask was not recorded"}
 
 
 @mcp.tool()
-def llm_cost_summary_tool() -> dict[str, Any]:
-    """Return Atlas LLM runtime model and spend summary (daily + process run)."""
-    return get_llm_runtime_info()
+def find_capability(query: str, include_unknown: bool = True, limit: int = 12) -> dict[str, Any]:
+    """Find a stack capability by what it does, and report whether it is still used.
+
+    Answers "do we already have something for X?" — the question that keeps
+    getting answered wrong because capabilities are built and then forgotten.
+    Searches the capability ledger (services, reverse-proxied surfaces, and
+    Atlas MCP tools) by id, name, summary, and invocation path.
+
+    Each hit carries `state` and `evidence`:
+      LIVE     used within 30 days; evidence names the journal entry or request count
+      IDLE     an invocation path exists, but nothing walked it in that window
+      DEAD     no invocation path found at all
+      UNKNOWN  no evidence source exists for this class — NOT a claim that it works
+
+    The ledger is written daily by capability-ledger.timer on the host. If it is
+    missing or stale, that is reported rather than papered over.
+    """
+    ledger_path = Path(os.environ.get(
+        "ATLAS_CAPABILITY_LEDGER",
+        "/opt/stack/services/automations/state/capability_ledger.json"))
+    try:
+        ledger = json.loads(ledger_path.read_text())
+    except Exception as exc:
+        # Recorded as `error`, never as `miss`: a broken ledger is not evidence
+        # that the stack lacks the capability, and scoring it as a gap would
+        # manufacture build proposals out of an outage.
+        _record_ask(query, "error", "find_capability", note=f"ledger unreadable: {exc}")
+        return {"error": True,
+                "reason": f"capability ledger unreadable ({exc}); "
+                          "check capability-ledger.timer on the host",
+                "results": []}
+
+    # Question words carry no signal and match everything — "queue a build"
+    # otherwise scores all 150 rows on the "a".
+    STOPWORDS = {
+        "a", "an", "the", "and", "or", "for", "to", "of", "in", "on", "is", "are",
+        "do", "does", "we", "i", "my", "our", "what", "which", "how", "can", "any",
+        "have", "has", "that", "this", "with", "use", "used", "using", "run",
+        "something", "anything", "thing", "stuff", "get", "there",
+    }
+    # Crude suffix stripping, enough to bridge execution/executor/executes and
+    # alerting/alert. Not a real stemmer, and not pretending to be one.
+    SUFFIXES = ("tion", "ing", "ion", "ers", "er", "or", "es", "ed", "ly", "s")
+
+    def stem(word: str) -> str:
+        for suf in SUFFIXES:
+            if len(word) - len(suf) >= 4 and word.endswith(suf):
+                return word[: -len(suf)]
+        return word
+
+    terms = [t for t in (w.strip(".,?!'\"") for w in query.lower().split())
+             if t and t not in STOPWORDS and len(t) > 2]
+    if not terms:
+        _record_ask(query, "error", "find_capability", note="no searchable terms")
+        return {"query": query, "match_count": 0, "returned": 0, "results": [],
+                "note": "query had no searchable terms after stopword removal"}
+
+    scored: list[tuple[int, dict[str, Any]]] = []
+    for row in ledger.get("rows", []):
+        if not include_unknown and row["state"] == "UNKNOWN":
+            continue
+        ident = f"{row.get('id', '')} {row.get('name', '')}".lower()
+        haystack = " ".join((
+            ident, row.get("search_text", ""), row.get("summary", ""),
+            row.get("invoke", ""),
+        )).lower()
+
+        # Weight identifier hits above prose hits so `talos` beats a service
+        # that merely mentions talos in its summary. Exact beats stemmed.
+        score = 0
+        for t in terms:
+            s = stem(t)
+            if t in ident:
+                score += 10
+            elif s in ident:
+                score += 6
+            elif t in haystack:
+                score += 2
+            elif s in haystack:
+                score += 1
+        if score:
+            scored.append((score, row))
+
+    order = {"LIVE": 0, "IDLE": 1, "DEAD": 2, "UNKNOWN": 3}
+    scored.sort(key=lambda p: (-p[0], order.get(p[1]["state"], 9), p[1]["id"]))
+
+    results = [{
+        "id": r["id"],
+        "class": r["class"],
+        "state": r["state"],
+        "summary": r.get("summary", ""),
+        "invoke": r.get("invoke", ""),
+        "last_used": r.get("last_used_human"),
+        "evidence": r.get("evidence", ""),
+    } for _, r in scored[:limit]]
+
+    # `stale` is the interesting outcome: the query DID match something, but
+    # nothing usable. Folding it into `hit` would hide the case where a
+    # capability exists on paper and cannot answer the ask.
+    if not results:
+        outcome = "miss"
+    elif any(r["state"] in ("LIVE", "IDLE") for r in results):
+        outcome = "hit"
+    else:
+        outcome = "stale"
+    _record_ask(query, outcome, "find_capability", matched=[r["id"] for r in results[:3]])
+
+    return {
+        "query": query,
+        "generated_at": ledger.get("generated_at"),
+        "match_count": len(scored),
+        "returned": len(results),
+        "results": results,
+        "note": "UNKNOWN means unmeasured, not working. Read `evidence` before acting.",
+    }
 
 
 @mcp.tool()
@@ -663,718 +865,6 @@ def get_session(id: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-def session_touch_history(
-    project_id: str = "",
-    source: str = "",
-    lifecycle: str = "",
-    since_hours: int = 168,
-    limit: int = 200,
-) -> list[dict[str, Any]]:
-    """Return recent sessions that touched one or more projects, ordered by timestamp desc."""
-    if limit < 1 or limit > 1000:
-        raise ValueError("limit must be between 1 and 1000")
-    if since_hours < 1 or since_hours > 24 * 365:
-        raise ValueError("since_hours must be between 1 and 8760")
-    if lifecycle and lifecycle not in _SESSION_LIFECYCLE_VALUES:
-        raise ValueError(f"lifecycle must be one of: {sorted(_SESSION_LIFECYCLE_VALUES)}")
-
-    store = _get_store()
-    sessions = store.get("session", {})
-    cutoff = datetime.now(timezone.utc).timestamp() - (since_hours * 3600)
-
-    rows: list[tuple[float, dict[str, Any]]] = []
-    for session_id, session in sessions.items():
-        payload = _model_to_dict(session)
-        if source and payload.get("source") != source:
-            continue
-        if lifecycle and payload.get("lifecycle", "active") != lifecycle:
-            continue
-
-        projects = payload.get("project_ids") or []
-        if project_id and project_id not in projects:
-            continue
-        if not projects:
-            continue
-
-        ts_dt = _parse_iso_or_none(payload.get("timestamp"))
-        ts_epoch = ts_dt.timestamp() if ts_dt else 0.0
-        if ts_epoch and ts_epoch < cutoff:
-            continue
-
-        rows.append(
-            (
-                ts_epoch,
-                {
-                    "id": session_id,
-                    "timestamp": payload.get("timestamp"),
-                    "source": payload.get("source"),
-                    "status": payload.get("status"),
-                    "lifecycle": payload.get("lifecycle", "active"),
-                    "project_ids": projects,
-                    "summary": payload.get("summary"),
-                    "tool_call_count": len(payload.get("tool_calls") or []),
-                },
-            )
-        )
-
-    rows.sort(key=lambda item: item[0], reverse=True)
-    return [item[1] for item in rows[:limit]]
-
-
-@mcp.tool()
-def session_activity_summary(source: str = "", since_hours: int = 168) -> dict[str, Any]:
-    """Return aggregate session activity and off-hours ratio for operator analytics."""
-    if since_hours < 1 or since_hours > 24 * 365:
-        raise ValueError("since_hours must be between 1 and 8760")
-
-    store = _get_store()
-    sessions = store.get("session", {})
-    cutoff = datetime.now(timezone.utc).timestamp() - (since_hours * 3600)
-
-    total = 0
-    off_hours = 0
-    by_lifecycle: dict[str, int] = {"active": 0, "archived": 0, "pruned": 0}
-    by_project: dict[str, int] = {}
-
-    for session in sessions.values():
-        payload = _model_to_dict(session)
-        if source and payload.get("source") != source:
-            continue
-        ts_dt = _parse_iso_or_none(payload.get("timestamp"))
-        ts_epoch = ts_dt.timestamp() if ts_dt else 0.0
-        if ts_epoch and ts_epoch < cutoff:
-            continue
-
-        total += 1
-
-        lifecycle = str(payload.get("lifecycle", "active"))
-        by_lifecycle[lifecycle] = by_lifecycle.get(lifecycle, 0) + 1
-
-        if ts_dt is not None:
-            # UTC off-hours heuristic: before 07:00 or after/equal 18:00.
-            if ts_dt.hour < 7 or ts_dt.hour >= 18:
-                off_hours += 1
-
-        for project in payload.get("project_ids") or []:
-            by_project[project] = by_project.get(project, 0) + 1
-
-    top_projects = sorted(by_project.items(), key=lambda item: item[1], reverse=True)[:10]
-
-    return {
-        "window_hours": since_hours,
-        "source": source or "*",
-        "total_sessions": total,
-        "off_hours_sessions": off_hours,
-        "off_hours_ratio": round((off_hours / total), 4) if total else 0.0,
-        "by_lifecycle": by_lifecycle,
-        "top_projects": [{"project_id": pid, "count": count} for pid, count in top_projects],
-    }
-
-
-@mcp.tool()
-def session_activity_deltas(
-    source: str = "",
-    current_hours: int = 168,
-    baseline_hours: int = 168,
-) -> dict[str, Any]:
-    """Return window-over-window session deltas and anomaly triage prompt suggestions."""
-    if current_hours < 1 or current_hours > 24 * 365:
-        raise ValueError("current_hours must be between 1 and 8760")
-    if baseline_hours < 1 or baseline_hours > 24 * 365:
-        raise ValueError("baseline_hours must be between 1 and 8760")
-
-    def _window_summary(
-        sessions: dict[str, Any],
-        source_filter: str,
-        start_epoch: float,
-        end_epoch: float,
-    ) -> dict[str, Any]:
-        total = 0
-        off_hours = 0
-        by_lifecycle: dict[str, int] = {"active": 0, "archived": 0, "pruned": 0}
-        by_project: dict[str, int] = {}
-
-        for session in sessions.values():
-            payload = _model_to_dict(session)
-            if source_filter and payload.get("source") != source_filter:
-                continue
-            ts_dt = _parse_iso_or_none(payload.get("timestamp"))
-            if ts_dt is None:
-                continue
-            ts_epoch = ts_dt.timestamp()
-            if ts_epoch < start_epoch or ts_epoch >= end_epoch:
-                continue
-
-            total += 1
-            lifecycle = str(payload.get("lifecycle", "active"))
-            by_lifecycle[lifecycle] = by_lifecycle.get(lifecycle, 0) + 1
-            if ts_dt.hour < 7 or ts_dt.hour >= 18:
-                off_hours += 1
-            for project in payload.get("project_ids") or []:
-                by_project[project] = by_project.get(project, 0) + 1
-
-        return {
-            "total": total,
-            "off_hours": off_hours,
-            "off_hours_ratio": (off_hours / total) if total else 0.0,
-            "by_lifecycle": by_lifecycle,
-            "by_project": by_project,
-        }
-
-    now_epoch = datetime.now(timezone.utc).timestamp()
-    current_start = now_epoch - (current_hours * 3600)
-    baseline_end = current_start
-    baseline_start = baseline_end - (baseline_hours * 3600)
-
-    store = _get_store()
-    sessions = store.get("session", {})
-
-    current = _window_summary(sessions, source, current_start, now_epoch)
-    baseline = _window_summary(sessions, source, baseline_start, baseline_end)
-
-    total_delta = current["total"] - baseline["total"]
-    if baseline["total"]:
-        total_delta_pct = round((total_delta / baseline["total"]), 4)
-    else:
-        total_delta_pct = None
-
-    off_hours_ratio_delta = round(current["off_hours_ratio"] - baseline["off_hours_ratio"], 4)
-
-    all_projects = set(current["by_project"].keys()) | set(baseline["by_project"].keys())
-    project_deltas: list[dict[str, Any]] = []
-    for project_id in all_projects:
-        c = int(current["by_project"].get(project_id, 0))
-        b = int(baseline["by_project"].get(project_id, 0))
-        delta = c - b
-        if delta == 0:
-            continue
-        project_deltas.append(
-            {
-                "project_id": project_id,
-                "current": c,
-                "baseline": b,
-                "delta": delta,
-            }
-        )
-    project_deltas.sort(key=lambda item: abs(int(item["delta"])), reverse=True)
-
-    prompts: list[str] = []
-    if total_delta >= 3:
-        prompts.append(
-            "Session volume is elevated vs baseline. Which projects or tools account for the increase?"
-        )
-    if total_delta <= -3:
-        prompts.append(
-            "Session volume dropped vs baseline. Were automation paths changed or is operator activity missing?"
-        )
-    if off_hours_ratio_delta >= 0.2:
-        prompts.append(
-            "Off-hours activity ratio increased materially. Were these incident-driven sessions or expected maintenance windows?"
-        )
-    if off_hours_ratio_delta <= -0.2:
-        prompts.append(
-            "Off-hours activity ratio decreased materially. Confirm whether alert pressure has normalized."
-        )
-    if int(current["by_lifecycle"].get("active", 0)) >= 10 and int(current["by_lifecycle"].get("pruned", 0)) == 0:
-        prompts.append(
-            "Active sessions accumulated without pruning. Should retention sweep/archive-prune workflow run now?"
-        )
-
-    return {
-        "source": source or "*",
-        "window": {
-            "current_hours": current_hours,
-            "baseline_hours": baseline_hours,
-        },
-        "current": {
-            "total_sessions": current["total"],
-            "off_hours_sessions": current["off_hours"],
-            "off_hours_ratio": round(current["off_hours_ratio"], 4),
-            "by_lifecycle": current["by_lifecycle"],
-        },
-        "baseline": {
-            "total_sessions": baseline["total"],
-            "off_hours_sessions": baseline["off_hours"],
-            "off_hours_ratio": round(baseline["off_hours_ratio"], 4),
-            "by_lifecycle": baseline["by_lifecycle"],
-        },
-        "deltas": {
-            "total_sessions": total_delta,
-            "total_sessions_pct": total_delta_pct,
-            "off_hours_ratio": off_hours_ratio_delta,
-            "project_deltas": project_deltas[:10],
-        },
-        "anomaly_prompts": prompts,
-    }
-
-
-@mcp.tool()
-def session_operator_heatmap(source: str = "", since_hours: int = 168, limit: int = 20) -> dict[str, Any]:
-    """Return per-operator activity slices and service-level touch heatmap from sessions."""
-    if since_hours < 1 or since_hours > 24 * 365:
-        raise ValueError("since_hours must be between 1 and 8760")
-    if limit < 1 or limit > 200:
-        raise ValueError("limit must be between 1 and 200")
-
-    def _normalize_service_token(raw: Any) -> str:
-        token = str(raw or "").strip().lower()
-        if not token:
-            return ""
-        if ":" in token:
-            prefix, rest = token.split(":", 1)
-            if prefix in {"service", "container"} and rest.strip():
-                token = rest.strip()
-        return token
-
-    store = _get_store()
-    sessions = store.get("session", {})
-    cutoff = datetime.now(timezone.utc).timestamp() - (since_hours * 3600)
-
-    operator_summary: dict[str, dict[str, Any]] = {}
-    operator_service_counts: dict[str, dict[str, int]] = {}
-    service_counts: dict[str, int] = {}
-    total_sessions = 0
-
-    for session in sessions.values():
-        payload = _model_to_dict(session)
-        if source and payload.get("source") != source:
-            continue
-
-        ts_dt = _parse_iso_or_none(payload.get("timestamp"))
-        ts_epoch = ts_dt.timestamp() if ts_dt else 0.0
-        if ts_epoch and ts_epoch < cutoff:
-            continue
-
-        total_sessions += 1
-        operator_id = str(payload.get("user_id", "unknown"))
-        lifecycle = str(payload.get("lifecycle", "active"))
-
-        if operator_id not in operator_summary:
-            operator_summary[operator_id] = {
-                "user_id": int(payload.get("user_id", 0) or 0),
-                "total_sessions": 0,
-                "off_hours_sessions": 0,
-                "by_lifecycle": {"active": 0, "archived": 0, "pruned": 0},
-            }
-            operator_service_counts[operator_id] = {}
-
-        operator_summary[operator_id]["total_sessions"] += 1
-        operator_summary[operator_id]["by_lifecycle"][lifecycle] = (
-            operator_summary[operator_id]["by_lifecycle"].get(lifecycle, 0) + 1
-        )
-        if ts_dt is not None and (ts_dt.hour < 7 or ts_dt.hour >= 18):
-            operator_summary[operator_id]["off_hours_sessions"] += 1
-
-        session_services: set[str] = set()
-        for entity in payload.get("entities_touched") or []:
-            if str(entity).strip().lower().startswith(("service:", "container:")):
-                normalized = _normalize_service_token(entity)
-                if normalized:
-                    session_services.add(normalized)
-
-        for call in payload.get("tool_calls") or []:
-            if not isinstance(call, dict):
-                continue
-            args = call.get("args") or {}
-            if isinstance(args, dict):
-                for key in ("service", "container", "name"):
-                    if key in args:
-                        normalized = _normalize_service_token(args.get(key))
-                        if normalized:
-                            session_services.add(normalized)
-
-        for service_name in session_services:
-            service_counts[service_name] = service_counts.get(service_name, 0) + 1
-            user_service = operator_service_counts[operator_id]
-            user_service[service_name] = user_service.get(service_name, 0) + 1
-
-    operator_rows: list[dict[str, Any]] = []
-    for operator_id, summary in operator_summary.items():
-        total = int(summary.get("total_sessions", 0))
-        off_hours = int(summary.get("off_hours_sessions", 0))
-        svc = operator_service_counts.get(operator_id, {})
-        top_services = sorted(svc.items(), key=lambda item: item[1], reverse=True)[:5]
-        operator_rows.append(
-            {
-                "user_id": int(summary.get("user_id", 0)),
-                "total_sessions": total,
-                "off_hours_sessions": off_hours,
-                "off_hours_ratio": round((off_hours / total), 4) if total else 0.0,
-                "by_lifecycle": summary.get("by_lifecycle", {}),
-                "top_services": [{"service": name, "count": count} for name, count in top_services],
-            }
-        )
-
-    operator_rows.sort(key=lambda item: int(item.get("total_sessions", 0)), reverse=True)
-    top_services_overall = sorted(service_counts.items(), key=lambda item: item[1], reverse=True)[:limit]
-
-    return {
-        "source": source or "*",
-        "window_hours": since_hours,
-        "total_sessions": total_sessions,
-        "operator_count": len(operator_rows),
-        "operators": operator_rows[:limit],
-        "service_heatmap": [{"service": name, "count": count} for name, count in top_services_overall],
-    }
-
-
-@mcp.tool()
-def session_baseline_alerts(
-    source: str = "",
-    current_hours: int = 168,
-    baseline_hours: int = 168,
-    volume_delta_pct_threshold: float = 0.5,
-    off_hours_delta_pp_threshold: float = 20.0,
-    operator_spike_multiplier: float = 2.0,
-    min_operator_sessions: int = 3,
-) -> dict[str, Any]:
-    """Return proactive baseline drift alerts for session volume, off-hours ratio, and operator intensity."""
-    if current_hours < 1 or current_hours > 24 * 365:
-        raise ValueError("current_hours must be between 1 and 8760")
-    if baseline_hours < 1 or baseline_hours > 24 * 365:
-        raise ValueError("baseline_hours must be between 1 and 8760")
-    if volume_delta_pct_threshold <= 0:
-        raise ValueError("volume_delta_pct_threshold must be > 0")
-    if off_hours_delta_pp_threshold <= 0:
-        raise ValueError("off_hours_delta_pp_threshold must be > 0")
-    if operator_spike_multiplier <= 1:
-        raise ValueError("operator_spike_multiplier must be > 1")
-    if min_operator_sessions < 1:
-        raise ValueError("min_operator_sessions must be >= 1")
-
-    def _window_summary(
-        sessions: dict[str, Any],
-        source_filter: str,
-        start_epoch: float,
-        end_epoch: float,
-    ) -> dict[str, Any]:
-        total = 0
-        off_hours = 0
-        by_operator: dict[int, int] = {}
-        by_lifecycle: dict[str, int] = {"active": 0, "archived": 0, "pruned": 0}
-
-        for session in sessions.values():
-            payload = _model_to_dict(session)
-            if source_filter and payload.get("source") != source_filter:
-                continue
-
-            ts_dt = _parse_iso_or_none(payload.get("timestamp"))
-            if ts_dt is None:
-                continue
-            ts_epoch = ts_dt.timestamp()
-            if ts_epoch < start_epoch or ts_epoch >= end_epoch:
-                continue
-
-            total += 1
-            lifecycle = str(payload.get("lifecycle", "active"))
-            by_lifecycle[lifecycle] = by_lifecycle.get(lifecycle, 0) + 1
-
-            user_id = int(payload.get("user_id", 0) or 0)
-            by_operator[user_id] = by_operator.get(user_id, 0) + 1
-
-            if ts_dt.hour < 7 or ts_dt.hour >= 18:
-                off_hours += 1
-
-        return {
-            "total": total,
-            "off_hours": off_hours,
-            "off_hours_ratio": (off_hours / total) if total else 0.0,
-            "by_operator": by_operator,
-            "by_lifecycle": by_lifecycle,
-        }
-
-    now_epoch = datetime.now(timezone.utc).timestamp()
-    current_start = now_epoch - (current_hours * 3600)
-    baseline_end = current_start
-    baseline_start = baseline_end - (baseline_hours * 3600)
-
-    store = _get_store()
-    sessions = store.get("session", {})
-
-    current = _window_summary(sessions, source, current_start, now_epoch)
-    baseline = _window_summary(sessions, source, baseline_start, baseline_end)
-
-    alerts: list[dict[str, Any]] = []
-    recommendations: list[str] = []
-
-    baseline_total = int(baseline["total"])
-    current_total = int(current["total"])
-    total_delta = current_total - baseline_total
-    total_delta_pct = (total_delta / baseline_total) if baseline_total else None
-
-    if total_delta_pct is not None and abs(total_delta_pct) >= volume_delta_pct_threshold:
-        direction = "increase" if total_delta_pct > 0 else "decrease"
-        alerts.append(
-            {
-                "severity": "high" if abs(total_delta_pct) >= (2 * volume_delta_pct_threshold) else "medium",
-                "signal": "session_volume_drift",
-                "direction": direction,
-                "delta": total_delta,
-                "delta_pct": round(total_delta_pct, 4),
-                "threshold": volume_delta_pct_threshold,
-            }
-        )
-        recommendations.append(
-            "Review top project and service movers, then classify whether volume drift is incident-driven or expected workload change."
-        )
-
-    off_ratio_current = float(current["off_hours_ratio"])
-    off_ratio_baseline = float(baseline["off_hours_ratio"])
-    off_delta_pp = (off_ratio_current - off_ratio_baseline) * 100.0
-    if abs(off_delta_pp) >= off_hours_delta_pp_threshold:
-        direction = "increase" if off_delta_pp > 0 else "decrease"
-        alerts.append(
-            {
-                "severity": "high" if abs(off_delta_pp) >= (2 * off_hours_delta_pp_threshold) else "medium",
-                "signal": "off_hours_ratio_drift",
-                "direction": direction,
-                "delta_pp": round(off_delta_pp, 2),
-                "threshold_pp": off_hours_delta_pp_threshold,
-            }
-        )
-        recommendations.append(
-            "Validate off-hours spikes against maintenance windows and alert bursts; escalate if unexplained."
-        )
-
-    operator_spikes: list[dict[str, Any]] = []
-    all_operators = set(current["by_operator"].keys()) | set(baseline["by_operator"].keys())
-    for user_id in all_operators:
-        cur = int(current["by_operator"].get(user_id, 0))
-        base = int(baseline["by_operator"].get(user_id, 0))
-        if cur < min_operator_sessions:
-            continue
-        if base == 0:
-            if cur >= int(min_operator_sessions * operator_spike_multiplier):
-                operator_spikes.append({"user_id": user_id, "current": cur, "baseline": base, "ratio": None})
-            continue
-        ratio = cur / base
-        if ratio >= operator_spike_multiplier:
-            operator_spikes.append({"user_id": user_id, "current": cur, "baseline": base, "ratio": round(ratio, 2)})
-
-    if operator_spikes:
-        alerts.append(
-            {
-                "severity": "medium",
-                "signal": "operator_intensity_spike",
-                "spikes": operator_spikes[:10],
-                "threshold_multiplier": operator_spike_multiplier,
-            }
-        )
-        recommendations.append(
-            "Review operator-level concentration for potential paging imbalance, runbook friction, or single-operator overload."
-        )
-
-    if not alerts:
-        recommendations.append("No baseline drift alert crossed configured thresholds in this comparison window.")
-
-    return {
-        "source": source or "*",
-        "window": {"current_hours": current_hours, "baseline_hours": baseline_hours},
-        "thresholds": {
-            "volume_delta_pct_threshold": volume_delta_pct_threshold,
-            "off_hours_delta_pp_threshold": off_hours_delta_pp_threshold,
-            "operator_spike_multiplier": operator_spike_multiplier,
-            "min_operator_sessions": min_operator_sessions,
-        },
-        "current": {
-            "total_sessions": current_total,
-            "off_hours_ratio": round(off_ratio_current, 4),
-            "by_lifecycle": current["by_lifecycle"],
-        },
-        "baseline": {
-            "total_sessions": baseline_total,
-            "off_hours_ratio": round(off_ratio_baseline, 4),
-            "by_lifecycle": baseline["by_lifecycle"],
-        },
-        "alerts": alerts,
-        "recommendations": recommendations,
-    }
-
-
-@mcp.tool()
-def session_adaptive_thresholds(
-    source: str = "",
-    current_hours: int = 168,
-    history_hours: int = 24 * 56,
-    quantile: float = 0.75,
-    min_windows: int = 4,
-    sensitivity_floor: float = 0.8,
-    sensitivity_ceiling: float = 1.8,
-) -> dict[str, Any]:
-    """Return adaptive threshold profiles using rolling quantiles and per-project sensitivity."""
-    if current_hours < 1 or current_hours > 24 * 365:
-        raise ValueError("current_hours must be between 1 and 8760")
-    if history_hours < current_hours * 2:
-        raise ValueError("history_hours must be at least 2 * current_hours")
-    if quantile <= 0 or quantile >= 1:
-        raise ValueError("quantile must be between 0 and 1 (exclusive)")
-    if min_windows < 2:
-        raise ValueError("min_windows must be at least 2")
-    if sensitivity_floor <= 0:
-        raise ValueError("sensitivity_floor must be > 0")
-    if sensitivity_ceiling < sensitivity_floor:
-        raise ValueError("sensitivity_ceiling must be >= sensitivity_floor")
-
-    def _window_counts(
-        sessions: dict[str, Any],
-        source_filter: str,
-        start_epoch: float,
-        end_epoch: float,
-    ) -> tuple[int, dict[str, int]]:
-        total = 0
-        by_project: dict[str, int] = {}
-        for session in sessions.values():
-            payload = _model_to_dict(session)
-            if source_filter and payload.get("source") != source_filter:
-                continue
-            ts_dt = _parse_iso_or_none(payload.get("timestamp"))
-            if ts_dt is None:
-                continue
-            ts_epoch = ts_dt.timestamp()
-            if ts_epoch < start_epoch or ts_epoch >= end_epoch:
-                continue
-            total += 1
-            for project_id in payload.get("project_ids") or []:
-                by_project[project_id] = by_project.get(project_id, 0) + 1
-        return total, by_project
-
-    store = _get_store()
-    sessions = store.get("session", {})
-    now_epoch = datetime.now(timezone.utc).timestamp()
-
-    current_start = now_epoch - (current_hours * 3600)
-    current_total, current_projects = _window_counts(sessions, source, current_start, now_epoch)
-
-    window_count = max(1, history_hours // current_hours)
-    historical_totals: list[float] = []
-    project_history: dict[str, list[float]] = {}
-
-    for i in range(1, window_count + 1):
-        end_epoch = now_epoch - (i * current_hours * 3600)
-        start_epoch = end_epoch - (current_hours * 3600)
-        total, projects = _window_counts(sessions, source, start_epoch, end_epoch)
-        historical_totals.append(float(total))
-        for project_id, count in projects.items():
-            project_history.setdefault(project_id, []).append(float(count))
-
-    profiles: list[dict[str, Any]] = []
-    alerts: list[dict[str, Any]] = []
-
-    project_ids = set(project_history.keys()) | set(current_projects.keys())
-    for project_id in sorted(project_ids):
-        history = project_history.get(project_id, [])
-        current_count = int(current_projects.get(project_id, 0))
-        if len(history) < min_windows:
-            profiles.append(
-                {
-                    "project_id": project_id,
-                    "current": current_count,
-                    "history_windows": len(history),
-                    "adaptive_threshold": None,
-                    "sensitivity": None,
-                    "note": "insufficient_history",
-                }
-            )
-            continue
-
-        p50 = _quantile(history, 0.5)
-        p90 = _quantile(history, 0.9)
-        base = _quantile(history, quantile)
-        variability = (p90 / max(p50, 1.0)) if p90 > 0 else 1.0
-        sensitivity = _clamp(1.0 + ((variability - 1.0) * 0.5), sensitivity_floor, sensitivity_ceiling)
-        threshold = base * sensitivity
-
-        profiles.append(
-            {
-                "project_id": project_id,
-                "current": current_count,
-                "history_windows": len(history),
-                "p50": round(p50, 3),
-                "p90": round(p90, 3),
-                "base_quantile": round(base, 3),
-                "variability": round(variability, 3),
-                "sensitivity": round(sensitivity, 3),
-                "adaptive_threshold": round(threshold, 3),
-            }
-        )
-
-        if float(current_count) > threshold:
-            alerts.append(
-                {
-                    "signal": "project_session_intensity_above_adaptive_threshold",
-                    "project_id": project_id,
-                    "current": current_count,
-                    "threshold": round(threshold, 3),
-                    "excess": round(float(current_count) - threshold, 3),
-                    "severity": "high" if float(current_count) > (threshold * 1.5) else "medium",
-                }
-            )
-
-    global_profile: dict[str, Any]
-    if len(historical_totals) < min_windows:
-        global_profile = {
-            "current": current_total,
-            "history_windows": len(historical_totals),
-            "adaptive_threshold": None,
-            "note": "insufficient_history",
-        }
-    else:
-        g_p50 = _quantile(historical_totals, 0.5)
-        g_p90 = _quantile(historical_totals, 0.9)
-        g_base = _quantile(historical_totals, quantile)
-        g_variability = (g_p90 / max(g_p50, 1.0)) if g_p90 > 0 else 1.0
-        g_sensitivity = _clamp(1.0 + ((g_variability - 1.0) * 0.5), sensitivity_floor, sensitivity_ceiling)
-        g_threshold = g_base * g_sensitivity
-        global_profile = {
-            "current": current_total,
-            "history_windows": len(historical_totals),
-            "p50": round(g_p50, 3),
-            "p90": round(g_p90, 3),
-            "base_quantile": round(g_base, 3),
-            "variability": round(g_variability, 3),
-            "sensitivity": round(g_sensitivity, 3),
-            "adaptive_threshold": round(g_threshold, 3),
-        }
-        if float(current_total) > g_threshold:
-            alerts.insert(
-                0,
-                {
-                    "signal": "global_session_volume_above_adaptive_threshold",
-                    "current": current_total,
-                    "threshold": round(g_threshold, 3),
-                    "excess": round(float(current_total) - g_threshold, 3),
-                    "severity": "high" if float(current_total) > (g_threshold * 1.5) else "medium",
-                },
-            )
-
-    recommendations: list[str] = []
-    if alerts:
-        recommendations.append("Inspect alerted projects against top service and operator heatmaps before opening follow-on tasks.")
-        recommendations.append("For high-variance projects, tune sensitivity profile rather than suppressing alerts globally.")
-    else:
-        recommendations.append("No adaptive threshold breaches detected for this comparison horizon.")
-
-    return {
-        "source": source or "*",
-        "window": {
-            "current_hours": current_hours,
-            "history_hours": history_hours,
-            "history_windows": window_count,
-        },
-        "model": {
-            "quantile": quantile,
-            "min_windows": min_windows,
-            "sensitivity_floor": sensitivity_floor,
-            "sensitivity_ceiling": sensitivity_ceiling,
-        },
-        "global_profile": global_profile,
-        "project_profiles": profiles[:50],
-        "alerts": alerts,
-        "recommendations": recommendations,
-    }
-
-
-@mcp.tool()
 def list_services() -> list[dict[str, Any]]:
     """List all services with key operational fields."""
     store = _get_store()
@@ -1390,6 +880,7 @@ def list_services() -> list[dict[str, Any]]:
             "host": s.get("host", {}).get("id"),
             "port": s.get("port"),
             "health_endpoint": s.get("health_endpoint"),
+            "publication_disposition": s.get("publication_disposition"),
         })
     return result
 
@@ -1497,8 +988,58 @@ def get_server(id: str) -> dict[str, Any]:
 
 
 @mcp.tool()
+def list_servers() -> list[dict[str, Any]]:
+    """List server entities — the physical/virtual hosts services are deployed on."""
+    store = _get_store()
+    servers = store.get("server", {})
+    result = []
+    for sid, srv in sorted(servers.items()):
+        s = _model_to_dict(srv)
+        result.append({
+            "id": s.get("id"),
+            "name": s.get("name"),
+            "hostname": s.get("hostname"),
+            "ip": s.get("ip"),
+            "hardware": s.get("hardware"),
+            "node_class": s.get("node_class"),
+        })
+    return result
+
+
+@mcp.tool()
+def list_vocabularies() -> list[dict[str, Any]]:
+    """List every vocabulary with its legal value_ids inline.
+
+    Call this before any write. Vocab-valued arguments on add_*/update_* tools take a
+    bare value_id (e.g. 'systemd_unit', not 'vocab:service_types:systemd_unit'), and an
+    unknown value_id is rejected before the write — nothing is committed. This is the
+    only way to discover the legal set; guessing is what put four unresolvable refs into
+    a live consumer_profile in 2026-07.
+    """
+    store = _get_store()
+    vocabs = store.get("vocabulary", {})
+    result = []
+    for vid, vocab in sorted(vocabs.items()):
+        v = _model_to_dict(vocab)
+        values = v.get("values") or []
+        result.append({
+            "id": v.get("id"),
+            "name": v.get("name"),
+            "purpose": v.get("purpose"),
+            "extension_policy": v.get("extension_policy"),
+            "value_ids": [item.get("id") for item in values if not item.get("deprecated")],
+            "deprecated_value_ids": [item.get("id") for item in values if item.get("deprecated")],
+            "value_count": len(values),
+        })
+    return result
+
+
+@mcp.tool()
 def get_vocabulary(id: str) -> dict[str, Any]:
-    """Return a vocabulary with all its values. Example ids: lifecycle_categories, service_types, agent_lanes."""
+    """Return one vocabulary with all its values (id, name, description, semantics, deprecated).
+
+    For just the legal value_ids across every vocabulary at once, use list_vocabularies().
+    """
     store = _get_store()
     vocabs = store.get("vocabulary", {})
     vocab = vocabs.get(id)
@@ -1522,10 +1063,13 @@ def list_rules(scope: str = "", severity: str = "") -> list[dict[str, Any]]:
             continue
         result.append({
             "id": r.get("id"),
+            "name": r.get("name"),
             "scope": r.get("scope", {}).get("value_id"),
             "severity": r.get("severity", {}).get("value_id"),
             "applies_to": r.get("applies_to"),
-            "must_satisfy": r.get("must_satisfy", "").strip(),
+            "check_kind": r.get("check_kind", {}).get("value_id"),
+            "fix_tier": r.get("fix_tier", {}).get("value_id"),
+            "enforcement_point": r.get("enforcement_point", {}).get("value_id"),
         })
     return result
 
@@ -1542,34 +1086,323 @@ def get_rule(id: str) -> dict[str, Any]:
     return _model_to_dict(rule)
 
 
+# Sentinel for update_rule: "" already means "argument not supplied" across every write
+# tool, so it cannot express "set this field to null" — which is exactly what moving a
+# rule to fix_tier=flag requires.
+_NULL_SENTINEL = "__NULL__"
+
+
+def _enforce_fix_tier_contract(fix_tier: str, fix_action: str | None) -> None:
+    """Cross-field contract from schemas/rule.py, enforced pre-write.
+
+    Redundant with the schema (which the write gate now runs before committing), but it
+    returns a precise, actionable message instead of a pydantic traceback.
+    """
+    has_action = bool(fix_action and fix_action.strip())
+    if fix_tier == "flag" and has_action:
+        raise ValueError(
+            "fix_action must be empty when fix_tier is 'flag' (a flag only reports; it "
+            f"prescribes no fix). Pass fix_action='{_NULL_SENTINEL}' to clear it."
+        )
+    if fix_tier in {"auto", "propose", "block"} and not has_action:
+        raise ValueError(
+            f"fix_action is required when fix_tier is '{fix_tier}' — it must state the "
+            "exact remediation steps."
+        )
+
+
 @mcp.tool()
-def list_agents() -> list[dict[str, Any]]:
-    """List all agent entities with key capability fields."""
+def add_rule(
+    id: str,
+    name: str,
+    description: str,
+    scope: str,
+    severity: str,
+    applies_to: str,
+    check_kind: str,
+    check_definition: str,
+    fix_tier: str,
+    enforcement_point: str,
+    on_violation: str,
+    fix_action: str = "",
+    min_plan_number: int = 0,
+    authored_by: str = "atlas-mcp",
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """Add a new rule entity — a structural assertion Atlas enforces across the stack.
+
+    CONFIRM-GATED, unlike the other add_* tools. Rules govern agent behaviour, so an agent
+    that could silently author its own governing rules could author the one that authorizes
+    what it wants to do. Returns a preview when confirm=False (default); call again with
+    confirm=True and the same args to apply.
+
+    Vocab args take a bare value_id and are validated before the write —
+    call list_vocabularies() for the legal sets:
+      scope: rule_scopes            severity: rule_severities
+      check_kind: rule_check_kinds  fix_tier: rule_fix_tiers
+      enforcement_point: enforcement_points
+
+    fix_action is REQUIRED when fix_tier is auto, propose, or block (it must give the exact
+    remediation steps), and MUST be empty when fix_tier is 'flag' (a flag only reports).
+
+    applies_to: what the rule binds to, e.g. 'service_entity:mcp_http', 'plan_document'.
+    check_definition: the assertion itself, interpreted per check_kind.
+    on_violation: what an agent should do when the rule trips.
+    """
     store = _get_store()
-    agents = store.get("agent", {})
+    if id in store.get("rule", {}):
+        raise ValueError(f"Rule '{id}' already exists. Use update_rule to modify it.")
+
+    _enforce_fix_tier_contract(fix_tier, fix_action)
+
+    now = _now_iso()
+    data: dict[str, Any] = {
+        "id": id,
+        "name": name,
+        "description": description,
+        "scope": f"vocab:rule_scopes:{scope}",
+        "severity": f"vocab:rule_severities:{severity}",
+        "applies_to": applies_to,
+        "check_kind": f"vocab:rule_check_kinds:{check_kind}",
+        "check_definition": check_definition,
+        "fix_tier": f"vocab:rule_fix_tiers:{fix_tier}",
+        "fix_action": fix_action.strip() if fix_action.strip() else None,
+        "enforcement_point": f"vocab:enforcement_points:{enforcement_point}",
+        "on_violation": on_violation,
+        "authored_by": authored_by,
+        "created_at": now,
+        "updated_at": now,
+    }
+    if min_plan_number:
+        data["min_plan_number"] = min_plan_number
+
+    if not confirm:
+        check = _validate_entity("rules", id, data)
+        return {
+            "action": "preview",
+            "id": id,
+            "after": data,
+            "validation": {"errors": check.errors, "warnings": check.warnings},
+            "note": "Call add_rule(id=..., confirm=True, ...) with the same args to apply.",
+        }
+
+    return _write_and_commit("rules", id, data, f"feat: add rule {id} via Atlas Write API")
+
+
+@mcp.tool()
+def update_rule(
+    id: str,
+    confirm: bool = False,
+    name: str = "",
+    description: str = "",
+    scope: str = "",
+    severity: str = "",
+    applies_to: str = "",
+    check_kind: str = "",
+    check_definition: str = "",
+    fix_tier: str = "",
+    fix_action: str = "",
+    enforcement_point: str = "",
+    on_violation: str = "",
+    min_plan_number: int = 0,
+) -> dict[str, Any]:
+    """Update fields on an existing rule entity.
+
+    Returns a before/after preview when confirm=False (default). Call again with confirm=True
+    and the same args to apply. Empty/0 arguments mean "leave unchanged".
+
+    To CLEAR fix_action (required when moving a rule to fix_tier='flag'), pass the sentinel
+    fix_action='__NULL__' — "" means "not supplied", so it cannot express "set to null".
+
+    The fix_tier/fix_action contract is checked against the MERGED result, not just the
+    arguments: update_rule(fix_tier='flag') alone is rejected if the rule already has a
+    fix_action, because the merged entity would be invalid.
+    """
+    store = _get_store()
+    rules = store.get("rule", {})
+    if id not in rules:
+        raise ValueError(f"Rule '{id}' not found. Known ids: {sorted(rules.keys())}")
+
+    rel_path = f"entities/rules/{id}.yaml"
+    abs_path = REPO_ROOT / rel_path
+    current_data = yaml.safe_load(abs_path.read_text(encoding="utf-8")) or {}
+
+    after = dict(current_data)
+    if name:
+        after["name"] = name
+    if description:
+        after["description"] = description
+    if scope:
+        after["scope"] = f"vocab:rule_scopes:{scope}"
+    if severity:
+        after["severity"] = f"vocab:rule_severities:{severity}"
+    if applies_to:
+        after["applies_to"] = applies_to
+    if check_kind:
+        after["check_kind"] = f"vocab:rule_check_kinds:{check_kind}"
+    if check_definition:
+        after["check_definition"] = check_definition
+    if fix_tier:
+        after["fix_tier"] = f"vocab:rule_fix_tiers:{fix_tier}"
+    if fix_action == _NULL_SENTINEL:
+        after["fix_action"] = None
+    elif fix_action:
+        after["fix_action"] = fix_action
+    if enforcement_point:
+        after["enforcement_point"] = f"vocab:enforcement_points:{enforcement_point}"
+    if on_violation:
+        after["on_violation"] = on_violation
+    if min_plan_number:
+        after["min_plan_number"] = min_plan_number
+
+    # Evaluate the contract against the merged entity, not the arguments — otherwise
+    # update_rule(fix_tier="flag") would slip past while the rule keeps its old fix_action.
+    merged_tier = str(after.get("fix_tier", "")).rsplit(":", 1)[-1]
+    _enforce_fix_tier_contract(merged_tier, after.get("fix_action"))
+
+    after["updated_at"] = _now_iso()
+
+    if not confirm:
+        check = _validate_entity("rules", id, after)
+        return {
+            "action": "preview",
+            "id": id,
+            "before": current_data,
+            "after": after,
+            "validation": {"errors": check.errors, "warnings": check.warnings},
+            "note": "Call update_rule(id=..., confirm=True, ...) with the same args to apply.",
+        }
+
+    return _write_and_commit("rules", id, after, f"chore: update rule {id} via Atlas Write API")
+
+
+@mcp.tool()
+def list_publications() -> list[dict[str, Any]]:
+    """List publication entities — the published public surface (GitHub repos/docs) and
+    their publication contract. Each is drift-checked by the publication-drift probe."""
+    store = _get_store()
+    pubs = store.get("publication", {})
     result = []
-    for aid, agent in sorted(agents.items()):
-        a = _model_to_dict(agent)
+    for pid, pub in sorted(pubs.items()):
+        p = _model_to_dict(pub)
         result.append({
-            "id": a.get("id"),
-            "name": a.get("name"),
-            "model_family": a.get("model_family"),
-            "interface": a.get("interface", {}).get("value_id"),
-            "primary_lane": a.get("primary_lane", {}).get("value_id"),
+            "id": p.get("id"),
+            "name": p.get("name"),
+            "github_repo": p.get("github_repo"),
+            "public": p.get("public"),
+            "source_kind": p.get("source_kind"),
+            "leak_gate_profile": p.get("leak_gate_profile"),
+            "last_published_commit": p.get("last_published_commit"),
+            "depends_on": [f"{d.get('entity_type')}:{d.get('id')}" for d in (p.get("depends_on") or [])],
         })
     return result
 
 
 @mcp.tool()
-def get_agent(id: str) -> dict[str, Any]:
-    """Return the full agent entity for the given id."""
+def get_publication(id: str) -> dict[str, Any]:
+    """Return the full publication entity (contract, source, deps, freshness policy)."""
     store = _get_store()
-    agents = store.get("agent", {})
-    agent = agents.get(id)
-    if agent is None:
-        ids = sorted(agents.keys())
-        raise ValueError(f"Agent '{id}' not found. Known ids: {ids}")
-    return _model_to_dict(agent)
+    pubs = store.get("publication", {})
+    pub = pubs.get(id)
+    if pub is None:
+        raise ValueError(f"Publication '{id}' not found. Known ids: {sorted(pubs.keys())}")
+    return _model_to_dict(pub)
+
+
+@mcp.tool()
+def add_publication(
+    id: str,
+    name: str,
+    github_repo: str,
+    remote: str = "",
+    public: bool = True,
+    local_source_path: str = "",
+    source_kind: str = "direct",
+    leak_gate_profile: str = "base",
+    last_published_commit: str = "",
+    depends_on: list[str] | None = None,
+    readme_freshness_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Add a new publication entity (a published repo + its publication contract).
+    Autonomous — writes and commits immediately. source_kind is 'direct' or 'derived';
+    leak_gate_profile is one of secrets|base|career; depends_on entries are 'publication:<id>'."""
+    store = _get_store()
+    if id in store.get("publication", {}):
+        raise ValueError(f"Publication '{id}' already exists. Use update_publication to modify it.")
+    now = _now_iso()
+    data: dict[str, Any] = {
+        "id": id,
+        "name": name,
+        "github_repo": github_repo,
+        "public": public,
+        "source_kind": source_kind,
+        "leak_gate_profile": leak_gate_profile,
+        "depends_on": depends_on or [],
+        "created_at": now,
+        "updated_at": now,
+    }
+    if remote:
+        data["remote"] = remote
+    if local_source_path:
+        data["local_source_path"] = local_source_path
+    if last_published_commit:
+        data["last_published_commit"] = last_published_commit
+    if readme_freshness_policy is not None:
+        data["readme_freshness_policy"] = readme_freshness_policy
+    return _write_and_commit("publications", id, data, f"feat: add publication {id} via Atlas Write API")
+
+
+@mcp.tool()
+def update_publication(
+    id: str,
+    confirm: bool = False,
+    last_published_commit: str = "",
+    last_usage_audit: str = "",
+    last_deep_check: str = "",
+    leak_gate_profile: str = "",
+    public: bool | None = None,
+    source_kind: str = "",
+    depends_on: list[str] | None = None,
+) -> dict[str, Any]:
+    """Update fields on a publication entity. Preview unless confirm=True.
+    Timestamp fields (last_usage_audit/last_deep_check) accept ISO-8601 or the literal 'now'."""
+    store = _get_store()
+    pubs = store.get("publication", {})
+    if id not in pubs:
+        raise ValueError(f"Publication '{id}' not found. Known ids: {sorted(pubs.keys())}")
+    rel_path = f"entities/publications/{id}.yaml"
+    abs_path = REPO_ROOT / rel_path
+    current_data: dict[str, Any] = yaml.safe_load(abs_path.read_text(encoding="utf-8")) or {}
+    after = dict(current_data)
+
+    def _ts(v: str) -> str:
+        return _now_iso() if v == "now" else v
+
+    if last_published_commit:
+        after["last_published_commit"] = last_published_commit
+    if last_usage_audit:
+        after["last_usage_audit"] = _ts(last_usage_audit)
+    if last_deep_check:
+        after["last_deep_check"] = _ts(last_deep_check)
+    if leak_gate_profile:
+        after["leak_gate_profile"] = leak_gate_profile
+    if public is not None:
+        after["public"] = public
+    if source_kind:
+        after["source_kind"] = source_kind
+    if depends_on is not None:
+        after["depends_on"] = depends_on
+    after["updated_at"] = _now_iso()
+
+    if not confirm:
+        return {
+            "action": "preview",
+            "id": id,
+            "before": current_data,
+            "after": after,
+            "note": "Call update_publication(id=..., confirm=True, ...) with the same args to apply.",
+        }
+    return _write_and_commit("publications", id, after, f"chore: update publication {id} via Atlas Write API")
 
 
 # ---------------------------------------------------------------------------
@@ -1591,8 +1424,12 @@ def add_project(
 ) -> dict[str, Any]:
     """Add a new project entity to the Atlas store. Autonomous — writes and commits immediately.
 
-    category: vocab value_id, e.g. 'current', 'live', 'blocked', 'defer', 'archive'
-    status: vocab value_id, e.g. 'concept', 'active', 'paused', 'complete'
+    Vocab value_ids are validated before the write; an unknown value is rejected and
+    nothing is committed. Call list_vocabularies() for the live legal set.
+
+    category: vocab value_id — one of: current, live, blocked, defer, archive
+    status: vocab value_id — one of: concept, scaffolded, in_progress, active,
+            installed, parked, archived
     concept_doc: path relative to services root, e.g. 'docs/kb/Projects/Foo/10-CONCEPT/FOO_CONCEPT.md'
     gdrive_folder: legacy Drive path metadata, optional; Drive retired as authoring surface 2026-05-09
     domain_tags: optional list of lowercase domain labels
@@ -1832,23 +1669,39 @@ def add_service(
     lifecycle: str,
     deployment_path: str,
     port: int = 0,
-    host: str = "server:hydra",
+    host: str = "server:example-host",
     owned_by: str = "",
     health_endpoint: str = "",
     systemd_unit: str = "",
     container_name: str = "",
+    owns_units: list[str] | None = None,
     restartable: str = "",
     tier: str = "",
     expected_state: str = "",
     protected_high_use: str = "",
     remote: str = "",
+    review_by: str = "",
 ) -> dict[str, Any]:
     """Add a new service entity to the Atlas store. Autonomous — writes and commits immediately.
 
-    service_type: vocab value_id, e.g. 'mcp_http', 'docker_compose', 'systemd', 'static'
-    lifecycle: vocab value_id, e.g. 'running', 'stopped', 'retired', 'planned'
-    host: TypedRef string, default 'server:hydra'
+    Vocab value_ids are validated before the write; an unknown value is rejected and
+    nothing is committed. Call list_vocabularies() for the live legal set.
+
+    service_type: vocab value_id — one of: mcp_http, mcp_stdio, fastapi, docker_container,
+                  systemd_unit, nginx_vhost, cloudflare_worker, cloudflare_pages
+    lifecycle: vocab value_id — one of: running, maintained, degraded, retired
+    host: TypedRef string, default 'server:example-host'
     owned_by: TypedRef string, e.g. 'project:atlas' (optional)
+    owns_units: every systemd unit and container this service owns, e.g.
+                ['aegis.timer', 'aegis-digest.timer', 'aegis-metrics.timer'].
+                This is the authoritative reality binding — the capability
+                ledger reports anything on the box that no entity claims here.
+                Declare all of them; one logical service commonly owns several
+                units, and guessing the rest from name prefixes is what let
+                units be absorbed by already-retired parents.
+    review_by: ISO date for anything temporary. Register things you intend to
+               retire immediately — the tombstone is the point — but give a
+               temporary thing a date so it cannot quietly become permanent.
     """
     store = _get_store()
     if id in store.get("service", {}):
@@ -1875,6 +1728,10 @@ def add_service(
         data["systemd_unit"] = systemd_unit
     if container_name:
         data["container_name"] = container_name
+    if owns_units:
+        data["owns_units"] = [str(u).strip() for u in owns_units if str(u).strip()]
+    if review_by:
+        data["review_by"] = review_by
     if restartable:
         data["restartable"] = restartable.strip().lower() in {"1", "true", "yes", "on"}
     if tier:
@@ -1898,6 +1755,7 @@ def update_service(
     health_endpoint: str = "",
     systemd_unit: str = "",
     container_name: str = "",
+    owns_units: list[str] | None = None,
     restartable: str = "",
     tier: str = "",
     expected_state: str = "",
@@ -1905,11 +1763,20 @@ def update_service(
     source_of_truth_doc: str = "",
     summary: str = "",
     remote: str = "",
+    publication_disposition: str = "",
+    publication_target: str = "",
+    review_by: str = "",
 ) -> dict[str, Any]:
     """Update fields on an existing service entity.
 
     Returns a before/after preview when confirm=False (default). Call again with confirm=True to apply.
-    lifecycle accepts value_ids (e.g. 'running', 'stopped', 'retired').
+    lifecycle accepts value_ids — one of: running, maintained, degraded, retired.
+    publication_disposition is one of private|fold|standalone|cookbook|undecided;
+    publication_target is the repo name (required for fold/standalone).
+    owns_units REPLACES the existing list rather than merging — pass the full
+    set of units/containers this service owns, or the ones you leave out become
+    UNREGISTERED on the capability ledger.
+    review_by is an ISO date for anything temporary.
     """
     store = _get_store()
     services = store.get("service", {})
@@ -1931,6 +1798,10 @@ def update_service(
         after["systemd_unit"] = systemd_unit
     if container_name:
         after["container_name"] = container_name
+    if owns_units is not None:
+        after["owns_units"] = [str(u).strip() for u in owns_units if str(u).strip()]
+    if review_by:
+        after["review_by"] = review_by
     if restartable:
         after["restartable"] = restartable.strip().lower() in {"1", "true", "yes", "on"}
     if tier:
@@ -1945,6 +1816,10 @@ def update_service(
         after["summary"] = summary
     if remote:
         after["remote"] = remote
+    if publication_disposition:
+        after["publication_disposition"] = publication_disposition
+    if publication_target:
+        after["publication_target"] = publication_target
     after["updated_at"] = _now_iso()
 
     if not confirm:
@@ -1960,10 +1835,15 @@ def update_service(
 
 
 @mcp.tool()
-def retire_service(id: str, confirm: bool = False) -> dict[str, Any]:
+def retire_service(id: str, confirm: bool = False, reason: str = "",
+                   superseded_by: str = "") -> dict[str, Any]:
     """Set a service lifecycle to 'retired' in the Atlas store.
 
     Returns a preview when confirm=False (default). Call again with confirm=True to apply.
+
+    `reason` and `superseded_by` are what make a retirement useful later. A bare
+    lifecycle flip records that something is gone but not why, so the same thing
+    gets rebuilt six months on. Say what it did and what replaced it.
     """
     store = _get_store()
     services = store.get("service", {})
@@ -1976,6 +1856,11 @@ def retire_service(id: str, confirm: bool = False) -> dict[str, Any]:
 
     after = dict(current_data)
     after["lifecycle"] = "vocab:service_lifecycles:retired"
+    after["retired_at"] = _now_iso()
+    if reason:
+        after["retired_reason"] = reason
+    if superseded_by:
+        after["superseded_by"] = superseded_by
     after["updated_at"] = _now_iso()
 
     if not confirm:
@@ -1984,10 +1869,107 @@ def retire_service(id: str, confirm: bool = False) -> dict[str, Any]:
             "id": id,
             "current_lifecycle": current_data.get("lifecycle"),
             "new_lifecycle": "vocab:service_lifecycles:retired",
+            "retired_reason": reason or "(none given — say why, or this is a dead end later)",
+            "superseded_by": superseded_by or "(nothing named)",
             "note": "Call retire_service(id=..., confirm=True) to apply.",
         }
 
     return _write_and_commit("services", id, after, f"chore: retire service {id} via Atlas Write API")
+
+
+@mcp.tool()
+def set_maintenance(id: str, hours: float, reason: str, confirm: bool = False) -> dict[str, Any]:
+    """Declare a maintenance window on a service.
+
+    Gate 1.1 (2026-07-27): persona restart/alert authority derives from entity
+    STATE, not a static allowlist. While the window is active (unexpired),
+    probe_runner's _apply_maintenance() passes every probe for this service --
+    no drift, no Aegis service_unhealthy -- and anything consulting
+    schemas.service.maintenance_active() must treat the entity as unlocked for
+    restart. `until` = now + hours (UTC), computed here so callers declare a
+    duration, not a timestamp.
+
+    The window auto-expires at read time once `until` passes -- no cleanup job
+    needed. To end it early, call clear_maintenance().
+
+    Returns a before/after preview when confirm=False (default). Call again
+    with confirm=True and the same args to apply.
+    """
+    store = _get_store()
+    services = store.get("service", {})
+    if id not in services:
+        raise ValueError(f"Service '{id}' not found. Known ids: {sorted(services.keys())}")
+    if hours <= 0:
+        raise ValueError("hours must be > 0")
+    if not reason.strip():
+        raise ValueError("reason is required")
+
+    rel_path = f"entities/services/{id}.yaml"
+    abs_path = REPO_ROOT / rel_path
+    current_data: dict[str, Any] = yaml.safe_load(abs_path.read_text(encoding="utf-8")) or {}
+
+    now = datetime.now(timezone.utc)
+    until = (now + timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    declared_at = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    after = dict(current_data)
+    after["maintenance"] = {
+        "active": True,
+        "until": until,
+        "reason": reason.strip(),
+        "declared_at": declared_at,
+    }
+    after["updated_at"] = _now_iso()
+
+    if not confirm:
+        return {
+            "action": "preview",
+            "id": id,
+            "before": current_data.get("maintenance"),
+            "after": after["maintenance"],
+            "note": f"Call set_maintenance(id={id!r}, hours={hours}, reason={reason!r}, confirm=True) to apply.",
+        }
+
+    result = _write_and_commit("services", id, after, f"chore: declare maintenance on {id} via Atlas Write API")
+    if "error" not in result:
+        result["maintenance"] = after["maintenance"]
+    return result
+
+
+@mcp.tool()
+def clear_maintenance(id: str, confirm: bool = False) -> dict[str, Any]:
+    """End a service's declared maintenance window early (sets active: false).
+
+    Normal auto-expiry (until passing) needs no action at all -- this is only
+    for ending a window before `until` arrives.
+
+    Returns a preview when confirm=False (default). Call again with
+    confirm=True to apply.
+    """
+    store = _get_store()
+    services = store.get("service", {})
+    if id not in services:
+        raise ValueError(f"Service '{id}' not found. Known ids: {sorted(services.keys())}")
+
+    rel_path = f"entities/services/{id}.yaml"
+    abs_path = REPO_ROOT / rel_path
+    current_data: dict[str, Any] = yaml.safe_load(abs_path.read_text(encoding="utf-8")) or {}
+
+    current_maintenance = current_data.get("maintenance")
+    after = dict(current_data)
+    after["maintenance"] = {**current_maintenance, "active": False} if current_maintenance else {"active": False}
+    after["updated_at"] = _now_iso()
+
+    if not confirm:
+        return {
+            "action": "preview",
+            "id": id,
+            "before": current_maintenance,
+            "after": after["maintenance"],
+            "note": f"Call clear_maintenance(id={id!r}, confirm=True) to apply.",
+        }
+
+    return _write_and_commit("services", id, after, f"chore: clear maintenance on {id} via Atlas Write API")
 
 
 @mcp.tool()
@@ -2084,6 +2066,240 @@ def add_task(
 
 
 @mcp.tool()
+def talos_queue_build(goal: str, repo: str, closure_test: str,
+                      constraints: list[str] | None = None, title: str = "") -> dict[str, Any]:
+    """Queue an autonomous build for Talos, the dictate-to-build executor.
+
+    Talos is a systemd watcher on the host that polls Atlas project 'talos'
+    every minute for open build-intent tasks, then runs headless Claude Code
+    (claude -p, flat-rate Max OAuth) in the target repo, commits + pushes the
+    result, writes the commit SHA back to this task, and pings Discord. Use this
+    to hand Talos a self-contained coding task to do unattended.
+
+    Provide:
+      goal:         what to build/change (the concrete outcome).
+      repo:         absolute target repo path. Talos operates default-allow
+                    inside /opt/stack/services/projects (protected existing
+                    projects are excluded); a new path under there is created.
+      closure_test: how to know it's done (load-bearing — an intent that can't
+                    state done is underspecified and bounces back).
+      constraints:  list of hard constraints (may be empty).
+      title:        optional short title; derived from goal if omitted.
+
+    Underspecified or ambiguous tasks are bounced to needs-clarification with a
+    Discord ping rather than guessed at. Returns the created task id.
+    """
+    if not isinstance(goal, str) or not goal.strip():
+        raise ValueError("goal must be a non-empty string describing what to build.")
+    if not isinstance(repo, str) or not repo.strip():
+        raise ValueError("repo must be a non-empty string (absolute target repo path).")
+    if not isinstance(closure_test, str) or not closure_test.strip():
+        raise ValueError("closure_test must be a non-empty string (how to know it's done).")
+
+    constraints = constraints or []
+    if not isinstance(constraints, list) or not all(isinstance(c, str) for c in constraints):
+        raise ValueError("constraints must be a list of strings.")
+
+    title = title.strip() if isinstance(title, str) else ""
+    if not title:
+        title = goal.strip()[:60]
+
+    project_id = _resolve_project_id("talos")
+    task_id = _next_task_id(project_id, title, "manual", "")
+    now = _now_iso()
+
+    notes = (
+        "Queued via talos_queue_build (Talos MCP front door).\n\n"
+        "```intent\n" + json.dumps({"repo": repo, "constraints": constraints}) + "\n```\n"
+    )
+
+    data: dict[str, Any] = {
+        "id": task_id,
+        "project_id": project_id,
+        "title": title,
+        "status": "open",
+        "priority": "high",
+        "task_type": "build-intent",
+        "next_action": goal,
+        "closure_test": closure_test,
+        "source": "manual",
+        "created_at": now,
+        "updated_at": now,
+        "notes": notes,
+    }
+
+    result = _write_and_commit("tasks", task_id, data, f"feat: queue talos build {task_id}")
+    if "error" in result:
+        return result
+    return {"ok": True, "task_id": task_id, "project_id": project_id, **result}
+
+
+# ---------------------------------------------------------------------------
+# Talos build lifecycle tools (status / list / cancel / requeue).
+# All operate only on project 'talos' tasks with task_type == 'build-intent'.
+# Talos is a systemd watcher that autonomously runs `claude -p` on any OPEN
+# build-intent task in project 'talos' — so flipping a task to 'open' (requeue)
+# hands it to an unattended build on the next poll (within a minute).
+# ---------------------------------------------------------------------------
+
+_TALOS_OUTCOME_VALUES = {"needs-review", "build-failed", "needs-clarification"}
+
+
+def _load_talos_build_task(task_id: str) -> dict[str, Any]:
+    """Load a Talos build-intent task as a plain dict.
+
+    Raises ValueError if the id doesn't exist or the task isn't a Talos build
+    task (project_id == 'talos' and task_type == 'build-intent')."""
+    store = _get_store()
+    tasks = store.get("task", {})
+    task = tasks.get(task_id)
+    if task is None:
+        raise ValueError(f"Talos build '{task_id}' not found.")
+    payload = _model_to_dict(task)
+    if payload.get("project_id") != "talos" or payload.get("task_type") != "build-intent":
+        raise ValueError(
+            f"Task '{task_id}' is not a Talos build "
+            f"(project_id={payload.get('project_id')!r}, task_type={payload.get('task_type')!r})."
+        )
+    return payload
+
+
+@mcp.tool()
+def talos_status(task_id: str) -> dict[str, Any]:
+    """Get the current state of a Talos build: status, outcome (needs-review with
+    commit SHA / build-failed / needs-clarification), and the disposition notes."""
+    payload = _load_talos_build_task(task_id)
+    return {
+        "task_id": task_id,
+        "title": payload.get("title"),
+        "status": payload.get("status"),
+        "outcome": payload.get("blocked_on") or None,
+        "goal": payload.get("next_action"),
+        "closure_test": payload.get("closure_test"),
+        "updated_at": payload.get("updated_at"),
+        "notes": payload.get("notes"),
+    }
+
+
+@mcp.tool()
+def talos_list_builds(limit: int = 20, state: str = "") -> dict[str, Any]:
+    """List recent Talos builds, newest first, optionally filtered by state
+    (open, in_progress, needs-review, build-failed, needs-clarification,
+    deferred, resolved)."""
+    if limit < 1 or limit > 1000:
+        raise ValueError("limit must be between 1 and 1000")
+
+    store = _get_store()
+    tasks = store.get("task", {})
+    builds: list[tuple[str, dict[str, Any]]] = []
+    for task_id, task in tasks.items():
+        payload = _model_to_dict(task)
+        if payload.get("project_id") != "talos" or payload.get("task_type") != "build-intent":
+            continue
+        builds.append((task_id, payload))
+
+    if state:
+        if state in _TASK_STATUS_VALUES:
+            builds = [b for b in builds if b[1].get("status") == state]
+        elif state in _TALOS_OUTCOME_VALUES:
+            builds = [b for b in builds if b[1].get("blocked_on") == state]
+        else:
+            allowed = sorted(_TASK_STATUS_VALUES | _TALOS_OUTCOME_VALUES)
+            raise ValueError(f"state must be empty or one of: {allowed}")
+
+    builds.sort(
+        key=lambda item: item[1].get("updated_at") or item[1].get("created_at"),
+        reverse=True,
+    )
+    builds = builds[:limit]
+
+    return {
+        "count": len(builds),
+        "builds": [
+            {
+                "id": task_id,
+                "title": payload.get("title"),
+                "status": payload.get("status"),
+                "outcome": payload.get("blocked_on") or None,
+                "updated_at": payload.get("updated_at"),
+            }
+            for task_id, payload in builds
+        ],
+    }
+
+
+@mcp.tool()
+def talos_cancel(task_id: str) -> dict[str, Any]:
+    """Cancel a queued (not-yet-started) Talos build by deferring it so the
+    watcher skips it."""
+    payload = _load_talos_build_task(task_id)
+    status = payload.get("status")
+    if status != "open":
+        blocked_on = payload.get("blocked_on")
+        reason = f"only a queued (open) build can be cancelled; this task is {status}"
+        if blocked_on:
+            reason += f"/{blocked_on}"
+        return {"ok": False, "task_id": task_id, "reason": reason}
+
+    rel_path = f"entities/tasks/{task_id}.yaml"
+    abs_path = REPO_ROOT / rel_path
+    after: dict[str, Any] = yaml.safe_load(abs_path.read_text(encoding="utf-8")) or {}
+    now = _now_iso()
+    existing_notes = after.get("notes") or ""
+    after["notes"] = (
+        existing_notes
+        + f"\n\n---\n[talos-cancel {now}] build cancelled by operator; Talos will not run it."
+    )
+    after["status"] = "deferred"
+    after.pop("resolved_at", None)
+    after["updated_at"] = now
+
+    result = _write_and_commit("tasks", task_id, after, f"chore: cancel talos build {task_id}")
+    if "error" in result:
+        return result
+    return {"ok": True, "task_id": task_id, "status": "deferred"}
+
+
+@mcp.tool()
+def talos_requeue(task_id: str, note: str = "") -> dict[str, Any]:
+    """Re-queue a finished or cancelled Talos build (e.g. after adding the missing
+    clarification the ping asked for) so the watcher runs it again. Preserves the
+    original intent; append a note describing what changed."""
+    payload = _load_talos_build_task(task_id)
+    status = payload.get("status")
+    if status == "in_progress":
+        return {
+            "ok": False,
+            "task_id": task_id,
+            "reason": "build is currently running; wait for it to finish before requeuing",
+        }
+
+    rel_path = f"entities/tasks/{task_id}.yaml"
+    abs_path = REPO_ROOT / rel_path
+    after: dict[str, Any] = yaml.safe_load(abs_path.read_text(encoding="utf-8")) or {}
+    now = _now_iso()
+    existing_notes = after.get("notes") or ""
+    line = f"\n\n---\n[talos-requeue {now}] re-queued for Talos"
+    if note:
+        line += f": {note}"
+    after["notes"] = existing_notes + line
+    after["status"] = "open"
+    after["blocked_on"] = ""
+    after.pop("resolved_at", None)
+    after["updated_at"] = now
+
+    result = _write_and_commit("tasks", task_id, after, f"chore: requeue talos build {task_id}")
+    if "error" in result:
+        return result
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "status": "open",
+        "note": "Talos will pick it up on the next cycle (within a minute)",
+    }
+
+
+@mcp.tool()
 def update_task(
     id: str,
     confirm: bool = False,
@@ -2152,8 +2368,8 @@ def update_task(
 
 
 # ---------------------------------------------------------------------------
-# Consolidated memories + trails (the consolidation loop, "the consolidation loop").
-# See the consolidation design notes.
+# Consolidated memories + trails (a consolidation loop).
+#
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
@@ -2206,120 +2422,6 @@ def get_memory(id: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-def add_memory(
-    memory_type: str,
-    statement: str,
-    confidence: float = 0.0,
-    status: str = "active",
-    superseded_by: str = "",
-    provenance: list[str] | None = None,
-    recurrence_sessions: int = 0,
-    first_seen: str = "",
-    last_seen: str = "",
-) -> dict[str, Any]:
-    """Add a consolidated memory. Id is derived from the statement (stable, dedups re-proposals).
-
-    memory_type: identity | preference | expertise | decision | reference
-    statement: one durable, self-contained sentence
-    provenance: shared-key Layer-3 pointers back to Substrate traces (episode_id / session:turn / path#section)
-    To supersede an existing memory, set status='superseded' and superseded_by=<new memory id>.
-    """
-    if memory_type not in _MEMORY_TYPE_VALUES:
-        raise ValueError(f"memory_type must be one of: {sorted(_MEMORY_TYPE_VALUES)}")
-    if status not in _MEMORY_STATUS_VALUES:
-        raise ValueError(f"status must be one of: {sorted(_MEMORY_STATUS_VALUES)}")
-    if not (0.0 <= confidence <= 1.0):
-        raise ValueError("confidence must be between 0.0 and 1.0")
-    if status == "superseded" and not superseded_by:
-        raise ValueError("superseded memories must set superseded_by")
-
-    now = _now_iso()
-    digest = hashlib.sha256(statement.strip().lower().encode("utf-8")).hexdigest()[:8]
-    memory_id = f"memory-{memory_type}-{digest}"
-
-    data: dict[str, Any] = {
-        "id": memory_id,
-        "memory_type": f"vocab:memory_types:{memory_type}",
-        "statement": statement,
-        "confidence": confidence,
-        "status": status,
-        "provenance": provenance or [],
-        "recurrence_sessions": recurrence_sessions,
-        "first_seen": first_seen or now,
-        "last_seen": last_seen or now,
-        "created_at": now,
-        "updated_at": now,
-    }
-    if status == "superseded":
-        data["superseded_by"] = superseded_by
-
-    result = _write_and_commit("memory", memory_id, data, f"feat: add memory {memory_id} via Atlas Write API")
-    if "error" in result:
-        return result
-    return {"ok": True, "memory_id": memory_id, **result}
-
-
-@mcp.tool()
-def update_memory(
-    id: str,
-    confirm: bool = False,
-    statement: str = "",
-    confidence: float = -1.0,
-    status: str = "",
-    superseded_by: str = "",
-    recurrence_sessions: int = -1,
-    add_provenance: list[str] | None = None,
-) -> dict[str, Any]:
-    """Update a memory via propose-confirm. To supersede it, set status='superseded'
-    and superseded_by=<new memory id>."""
-    store = _get_store()
-    memories = store.get("memory", {})
-    if id not in memories:
-        raise ValueError(f"Memory '{id}' not found. Known ids: {sorted(memories.keys())}")
-
-    rel_path = f"entities/memory/{id}.yaml"
-    abs_path = REPO_ROOT / rel_path
-    current_data: dict[str, Any] = yaml.safe_load(abs_path.read_text(encoding="utf-8")) or {}
-    after = dict(current_data)
-
-    if statement:
-        after["statement"] = statement
-    if confidence >= 0.0:
-        if confidence > 1.0:
-            raise ValueError("confidence must be between 0.0 and 1.0")
-        after["confidence"] = confidence
-    if status:
-        if status not in _MEMORY_STATUS_VALUES:
-            raise ValueError(f"status must be one of: {sorted(_MEMORY_STATUS_VALUES)}")
-        after["status"] = status
-    if superseded_by:
-        after["superseded_by"] = superseded_by
-    if recurrence_sessions >= 0:
-        after["recurrence_sessions"] = recurrence_sessions
-    if add_provenance:
-        after["provenance"] = list(current_data.get("provenance", []) or []) + list(add_provenance)
-
-    effective_status = after.get("status", "active")
-    if effective_status != "superseded":
-        after.pop("superseded_by", None)
-    elif not after.get("superseded_by"):
-        raise ValueError("superseding a memory requires superseded_by")
-
-    after["last_seen"] = _now_iso()
-    after["updated_at"] = _now_iso()
-
-    if not confirm:
-        return {
-            "action": "preview",
-            "id": id,
-            "before": current_data,
-            "after": after,
-            "note": "Call update_memory(id=..., confirm=True, ...) with the same args to apply.",
-        }
-    return _write_and_commit("memory", id, after, f"chore: update memory {id} via Atlas Write API")
-
-
-@mcp.tool()
 def list_trails(status: str = "", limit: int = 200) -> list[dict[str, Any]]:
     """List trail (exploratory lead) entities. Optional filter: status
     (open|pulled|led-somewhere|dead)."""
@@ -2361,378 +2463,6 @@ def get_trail(id: str) -> dict[str, Any]:
     if trail is None:
         raise ValueError(f"Trail '{id}' not found. Known ids: {sorted(trails.keys())}")
     return _model_to_dict(trail)
-
-
-@mcp.tool()
-def add_trail(
-    title: str,
-    signal: str,
-    question: str,
-    connects: list[str] | None = None,
-    status: str = "open",
-    score: float = 0.0,
-    provenance: list[str] | None = None,
-) -> dict[str, Any]:
-    """Add a trail (exploratory lead — a noticed adjacency worth pulling).
-
-    status: open | pulled | led-somewhere | dead   (new trails are normally 'open')
-    connects: the 2+ ideas/clusters it bridges
-    signal: why they seem adjacent; question: the open thread to pull
-    provenance: shared-key Layer-3 pointers back to Substrate traces
-    """
-    if status not in _TRAIL_STATUS_VALUES:
-        raise ValueError(f"status must be one of: {sorted(_TRAIL_STATUS_VALUES)}")
-    if not (0.0 <= score <= 1.0):
-        raise ValueError("score must be between 0.0 and 1.0")
-
-    now = _now_iso()
-    digest = hashlib.sha256(title.strip().lower().encode("utf-8")).hexdigest()[:8]
-    trail_id = f"trail-{_slugify_token(title)[:40]}-{digest}"
-
-    data: dict[str, Any] = {
-        "id": trail_id,
-        "title": title,
-        "connects": connects or [],
-        "signal": signal,
-        "question": question,
-        "status": f"vocab:trail_statuses:{status}",
-        "score": score,
-        "provenance": provenance or [],
-        "first_seen": now,
-        "last_seen": now,
-        "created_at": now,
-        "updated_at": now,
-    }
-    result = _write_and_commit("trail", trail_id, data, f"feat: add trail {trail_id} via Atlas Write API")
-    if "error" in result:
-        return result
-    return {"ok": True, "trail_id": trail_id, **result}
-
-
-@mcp.tool()
-def update_trail(
-    id: str,
-    confirm: bool = False,
-    status: str = "",
-    score: float = -1.0,
-    signal: str = "",
-    question: str = "",
-    connects: list[str] | None = None,
-    add_provenance: list[str] | None = None,
-) -> dict[str, Any]:
-    """Update a trail via propose-confirm. Common use: advance status
-    (open -> pulled -> led-somewhere|dead)."""
-    store = _get_store()
-    trails = store.get("trail", {})
-    if id not in trails:
-        raise ValueError(f"Trail '{id}' not found. Known ids: {sorted(trails.keys())}")
-
-    rel_path = f"entities/trail/{id}.yaml"
-    abs_path = REPO_ROOT / rel_path
-    current_data: dict[str, Any] = yaml.safe_load(abs_path.read_text(encoding="utf-8")) or {}
-    after = dict(current_data)
-
-    if status:
-        if status not in _TRAIL_STATUS_VALUES:
-            raise ValueError(f"status must be one of: {sorted(_TRAIL_STATUS_VALUES)}")
-        after["status"] = f"vocab:trail_statuses:{status}"
-    if score >= 0.0:
-        if score > 1.0:
-            raise ValueError("score must be between 0.0 and 1.0")
-        after["score"] = score
-    if signal:
-        after["signal"] = signal
-    if question:
-        after["question"] = question
-    if connects is not None:
-        after["connects"] = connects
-    if add_provenance:
-        after["provenance"] = list(current_data.get("provenance", []) or []) + list(add_provenance)
-
-    after["last_seen"] = _now_iso()
-    after["updated_at"] = _now_iso()
-
-    if not confirm:
-        return {
-            "action": "preview",
-            "id": id,
-            "before": current_data,
-            "after": after,
-            "note": "Call update_trail(id=..., confirm=True, ...) with the same args to apply.",
-        }
-    return _write_and_commit("trail", id, after, f"chore: update trail {id} via Atlas Write API")
-
-
-@mcp.tool()
-def list_consolidation_proposals(kind: str = "", limit: int = 50) -> dict[str, Any]:
-    """List pending consolidation proposals (memories + trails) from the the consolidation loop queue.
-
-    Read-only. kind: '' (both) | 'memory' | 'trail'. Each memory includes 'memory_id'
-    (the id it would receive) and 'already_promoted' (True if that memory already exists
-    in Atlas). To promote one, call add_memory(...) / add_trail(...) with its fields —
-    those go through the Kernel propose-confirm gate.
-    """
-    queue_path = Path("outputs/state/consolidation_proposals.json")
-    if not queue_path.exists():
-        return {"generated_at": None, "memories": [], "trails": [], "note": "no consolidation queue yet"}
-    data = json.loads(queue_path.read_text(encoding="utf-8"))
-    existing = _get_store().get("memory", {})
-
-    out: dict[str, Any] = {
-        "generated_at": data.get("stats", {}).get("generated_at"),
-        "stats": data.get("stats", {}),
-        "memories": [],
-        "trails": [],
-    }
-    if kind in ("", "memory"):
-        for m in data.get("memories", [])[:limit]:
-            digest = hashlib.sha256(m["statement"].strip().lower().encode("utf-8")).hexdigest()[:8]
-            mid = f"memory-{m['memory_type']}-{digest}"
-            out["memories"].append({**m, "memory_id": mid, "already_promoted": mid in existing})
-    if kind in ("", "trail"):
-        out["trails"] = data.get("trails", [])[:limit]
-    return out
-
-
-@mcp.tool()
-def add_session(
-    user_id: int,
-    source: str = "telegram-bot",
-    status: str = "completed",
-    lifecycle: str = "active",
-    retention_days: int = 30,
-    transcript: str = "",
-    summary: str = "",
-    tool_calls: list[dict[str, Any]] | None = None,
-    entities_touched: list[str] | None = None,
-    project_ids: list[str] | None = None,
-    source_request_id: str = "",
-    episode_id: str = "",
-    notes: str = "",
-) -> dict[str, Any]:
-    """Add a canonical session entity. Autonomous — writes and commits immediately."""
-    if status not in _SESSION_STATUS_VALUES:
-        raise ValueError(f"status must be one of: {sorted(_SESSION_STATUS_VALUES)}")
-    if lifecycle not in _SESSION_LIFECYCLE_VALUES:
-        raise ValueError(f"lifecycle must be one of: {sorted(_SESSION_LIFECYCLE_VALUES)}")
-    if retention_days < 1 or retention_days > 3650:
-        raise ValueError("retention_days must be between 1 and 3650")
-
-    normalized_source = source.strip() or "telegram-bot"
-
-    store = _get_store()
-    sessions = store.get("session", {})
-    if source_request_id:
-        for existing_session in sessions.values():
-            payload = _model_to_dict(existing_session)
-            if payload.get("source") == normalized_source and payload.get("source_request_id") == source_request_id:
-                return {
-                    "ok": True,
-                    "idempotent": True,
-                    "session_id": payload.get("id"),
-                    "session": payload,
-                }
-
-    session_id = _next_session_id(normalized_source, source_request_id)
-    now = _now_iso()
-    data: dict[str, Any] = {
-        "id": session_id,
-        "source": normalized_source,
-        "user_id": user_id,
-        "timestamp": now,
-        "status": status,
-        "lifecycle": lifecycle,
-        "retention_days": retention_days,
-        "tool_calls": tool_calls or [],
-        "entities_touched": entities_touched or [],
-        "project_ids": project_ids or [],
-        "created_at": now,
-        "updated_at": now,
-    }
-    if transcript:
-        data["transcript"] = transcript
-    if summary:
-        data["summary"] = summary
-    if source_request_id:
-        data["source_request_id"] = source_request_id
-    if episode_id:
-        data["episode_id"] = episode_id
-    if notes:
-        data["notes"] = notes
-
-    result = _write_and_commit("sessions", session_id, data, f"feat: add session {session_id} via Atlas Write API")
-    if "error" in result:
-        return result
-    return {
-        "ok": True,
-        "idempotent": False,
-        "session_id": session_id,
-        **result,
-    }
-
-
-@mcp.tool()
-def update_session(
-    id: str,
-    confirm: bool = False,
-    status: str = "",
-    lifecycle: str = "",
-    retention_days: int = 0,
-    summary: str = "",
-    transcript: str = "",
-    tool_calls: list[dict[str, Any]] | None = None,
-    entities_touched: list[str] | None = None,
-    project_ids: list[str] | None = None,
-    notes: str = "",
-) -> dict[str, Any]:
-    """Update fields on an existing session entity via propose-confirm pattern."""
-    store = _get_store()
-    sessions = store.get("session", {})
-    if id not in sessions:
-        raise ValueError(f"Session '{id}' not found. Known ids: {sorted(sessions.keys())}")
-
-    rel_path = f"entities/sessions/{id}.yaml"
-    abs_path = REPO_ROOT / rel_path
-    current_data: dict[str, Any] = yaml.safe_load(abs_path.read_text(encoding="utf-8")) or {}
-    after = dict(current_data)
-
-    if status:
-        if status not in _SESSION_STATUS_VALUES:
-            raise ValueError(f"status must be one of: {sorted(_SESSION_STATUS_VALUES)}")
-        after["status"] = status
-    if lifecycle:
-        if lifecycle not in _SESSION_LIFECYCLE_VALUES:
-            raise ValueError(f"lifecycle must be one of: {sorted(_SESSION_LIFECYCLE_VALUES)}")
-        after["lifecycle"] = lifecycle
-    if retention_days:
-        if retention_days < 1 or retention_days > 3650:
-            raise ValueError("retention_days must be between 1 and 3650")
-        after["retention_days"] = retention_days
-    if summary:
-        after["summary"] = summary
-    if transcript:
-        after["transcript"] = transcript
-    if tool_calls is not None:
-        after["tool_calls"] = tool_calls
-    if entities_touched is not None:
-        after["entities_touched"] = entities_touched
-    if project_ids is not None:
-        after["project_ids"] = project_ids
-    if notes:
-        after["notes"] = notes
-
-    effective_lifecycle = after.get("lifecycle", "active")
-    if effective_lifecycle == "active":
-        after.pop("archived_at", None)
-        after.pop("pruned_at", None)
-    elif effective_lifecycle == "archived":
-        after.setdefault("archived_at", _now_iso())
-        after.pop("pruned_at", None)
-    elif effective_lifecycle == "pruned":
-        after.setdefault("pruned_at", _now_iso())
-        transcript_value = str(after.get("transcript") or "")
-        if transcript_value:
-            after["transcript_sha256"] = hashlib.sha256(transcript_value.encode("utf-8")).hexdigest()
-            after["transcript"] = ""
-
-    after["updated_at"] = _now_iso()
-
-    if not confirm:
-        return {
-            "action": "preview",
-            "id": id,
-            "before": current_data,
-            "after": after,
-            "note": "Call update_session(id=..., confirm=True, ...) with the same args to apply.",
-        }
-
-    return _write_and_commit("sessions", id, after, f"chore: update session {id} via Atlas Write API")
-
-
-@mcp.tool()
-def archive_session(id: str, confirm: bool = False, reason: str = "") -> dict[str, Any]:
-    """Archive a session by setting lifecycle=archived and archived_at timestamp."""
-    store = _get_store()
-    sessions = store.get("session", {})
-    if id not in sessions:
-        raise ValueError(f"Session '{id}' not found. Known ids: {sorted(sessions.keys())}")
-
-    rel_path = f"entities/sessions/{id}.yaml"
-    abs_path = REPO_ROOT / rel_path
-    current_data: dict[str, Any] = yaml.safe_load(abs_path.read_text(encoding="utf-8")) or {}
-    after = dict(current_data)
-
-    if after.get("lifecycle", "active") == "pruned":
-        raise ValueError("Cannot archive a pruned session")
-
-    after["lifecycle"] = "archived"
-    after.setdefault("archived_at", _now_iso())
-    after.pop("pruned_at", None)
-    if reason:
-        prior_notes = str(after.get("notes") or "").strip()
-        reason_note = f"archive_reason={reason.strip()}"
-        after["notes"] = f"{prior_notes}\n{reason_note}".strip()
-    after["updated_at"] = _now_iso()
-
-    if not confirm:
-        return {
-            "action": "preview",
-            "id": id,
-            "before": current_data,
-            "after": after,
-            "note": "Call archive_session(id=..., confirm=True, ...) to apply.",
-        }
-
-    return _write_and_commit("sessions", id, after, f"chore: archive session {id} via Atlas Write API")
-
-
-@mcp.tool()
-def prune_session(id: str, confirm: bool = False, reason: str = "") -> dict[str, Any]:
-    """Prune a session transcript while preserving required audit metadata."""
-    store = _get_store()
-    sessions = store.get("session", {})
-    if id not in sessions:
-        raise ValueError(f"Session '{id}' not found. Known ids: {sorted(sessions.keys())}")
-
-    rel_path = f"entities/sessions/{id}.yaml"
-    abs_path = REPO_ROOT / rel_path
-    current_data: dict[str, Any] = yaml.safe_load(abs_path.read_text(encoding="utf-8")) or {}
-    after = dict(current_data)
-
-    lifecycle = str(after.get("lifecycle", "active"))
-    if lifecycle not in {"archived", "pruned"}:
-        raise ValueError("Session must be archived before pruning")
-
-    transcript_value = str(after.get("transcript") or "")
-    if transcript_value:
-        after["transcript_sha256"] = hashlib.sha256(transcript_value.encode("utf-8")).hexdigest()
-        after["transcript"] = ""
-
-    # Preserve canonical audit metadata even when transcript is removed.
-    if not after.get("summary"):
-        raise ValueError("Cannot prune session without summary metadata")
-    if not after.get("tool_calls"):
-        raise ValueError("Cannot prune session without tool_calls metadata")
-    if not after.get("entities_touched"):
-        raise ValueError("Cannot prune session without entities_touched metadata")
-
-    after["lifecycle"] = "pruned"
-    after.setdefault("archived_at", _now_iso())
-    after["pruned_at"] = _now_iso()
-    if reason:
-        after["prune_reason"] = reason.strip()
-    after["updated_at"] = _now_iso()
-
-    if not confirm:
-        return {
-            "action": "preview",
-            "id": id,
-            "before": current_data,
-            "after": after,
-            "note": "Call prune_session(id=..., confirm=True, ...) to apply.",
-        }
-
-    return _write_and_commit("sessions", id, after, f"chore: prune session {id} via Atlas Write API")
 
 
 @mcp.tool()
@@ -2981,15 +2711,16 @@ def sync_project_next_actions_from_tasks(project: str = "", confirm: bool = Fals
 
 
 DEFAULT_OUTPUTS_DIR = REPO_ROOT / "outputs"
-DEFAULT_KB_DOC_ROOT = Path("outputs/kb")
+DEFAULT_KB_DOC_ROOT = Path("/opt/stack/services/docs/kb")
 DEFAULT_KB_OUTPUT_DIR = DEFAULT_KB_DOC_ROOT / "Projects" / "Atlas" / "40-OUTPUT"
-DEFAULT_SERVICES_REPO_ROOT = Path(".")
+DEFAULT_SERVICES_REPO_ROOT = Path("/opt/stack/services")
 KB_ROOT_ALLOWED_FILES = {
     "Start Here.md",
     "Standards.md",
     "Project Index.md",
     "The Latest.md",
     "System Log.md",
+    "How I Work.md",
 }
 
 
@@ -3086,8 +2817,8 @@ def _git_commit_paths(repo_root: Path, rel_paths: list[str], message: str) -> di
         **os.environ,
         "GIT_AUTHOR_NAME": "atlas-mcp",
         "GIT_COMMITTER_NAME": "atlas-mcp",
-        "GIT_AUTHOR_EMAIL": "atlas@example.local",
-        "GIT_COMMITTER_EMAIL": "atlas@example.local",
+        "GIT_AUTHOR_EMAIL": "atlas-mcp@atlas-instance.local",
+        "GIT_COMMITTER_EMAIL": "atlas-mcp@atlas-instance.local",
     }
 
     with atlas_write_lock(repo_root):
@@ -3152,33 +2883,8 @@ def _git_commit_paths(repo_root: Path, rel_paths: list[str], message: str) -> di
 
 
 @mcp.tool()
-def get_output(name: str) -> str:
-    """Read a generated output file from Atlas output directories.
-
-    Pass the filename exactly as it appears (e.g. 'Service Catalog.md',
-    'Rules.md', 'Project Index (generated).md'). Returns the file content.
-    """
-    legacy_outputs_dir = Path(os.environ.get("ATLAS_OUTPUT_DIR", str(DEFAULT_OUTPUTS_DIR))).resolve()
-    kb_outputs_dir = Path(os.environ.get("ATLAS_KB_OUTPUT_DIR", str(DEFAULT_KB_OUTPUT_DIR))).resolve()
-
-    search_roots = [kb_outputs_dir, legacy_outputs_dir]
-    for root in search_roots:
-        target = (root / name).resolve()
-        # Guard against path traversal for each root.
-        if not str(target).startswith(str(root)):
-            raise ValueError(f"Invalid output name: {name!r}")
-        if target.exists():
-            return target.read_text(encoding="utf-8")
-
-    raise FileNotFoundError(
-        f"Output '{name}' not found. Searched: {kb_outputs_dir}, {legacy_outputs_dir}. "
-        "Run the Atlas pipeline generation step to refresh outputs."
-    )
-
-
-@mcp.tool()
 def get_kb_doc(name: str) -> str:
-    """Read a knowledge base document from services/docs/kb/.
+    """Read a knowledge base document from the configured KB doc root.
 
     Pass a relative path such as 'Start Here.md', 'Standards.md', or
     'Projects/atlas/10-CONCEPT/ATLAS_CONCEPT.md'. Returns the file content.
@@ -3191,17 +2897,116 @@ def get_kb_doc(name: str) -> str:
     if not target.exists():
         raise FileNotFoundError(
             f"KB doc '{name}' not found under {kb_root}. "
-            "Run Track A3 migration to populate services/docs/kb/."
+            "This KB root has no such document yet — create it via create_kb_doc "
+            "or check the path with a directory-level doc listing."
         )
     return target.read_text(encoding="utf-8")
 
 
+# --- KB degenerate-payload guard (create_kb_doc / update_kb_doc) -------------
+# Both tools take the ENTIRE document as `content`, so a payload that was never
+# real content destroys the doc on confirm. Two near-misses in the week of
+# 2026-07-27, both self-caught by the calling agent and neither guarded against:
+# a literal unexpanded "$(cat ...)" string, and a "__SAME_AS_ABOVE__" token.
+# Same posture as the H1 whole-file guard in _kb_replace_section_text: refuse the
+# obviously-degenerate shapes, keep each check narrow so real writes are
+# untouched (fenced/inline-code occurrences are exempt — a doc that QUOTES these
+# shapes is fine), and give the one occasionally-intended shape (a much smaller
+# replacement doc) an explicit allow_shrink flag on update_kb_doc.
+
+_KB_SUBSTITUTION_PAYLOAD_RE = re.compile(r"^(?:\$\(.+\)|\$\{.+\}|`.+`)$", re.DOTALL)
+_KB_CAT_SUBSTITUTION_RE = re.compile(r"\$\((?:cat|<)[ \t]")
+_KB_PLACEHOLDER_TOKEN_RE = re.compile(r"\b__[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+__\b")
+_KB_PLACEHOLDER_LINE_RE = re.compile(r"^__[A-Z][A-Z0-9_]*__$")
+_KB_INLINE_CODE_RE = re.compile(r"`[^`]*`")
+
+_KB_SHRINK_MIN_CHARS = 800   # existing docs smaller than this may shrink freely
+_KB_SHRINK_RATIO = 3         # refuse when new content < old/3 without allow_shrink
+
+
+def _kb_prose_lines(content: str):
+    """Yield (line_no, line) for lines outside fenced code blocks, with inline
+    code spans stripped — the degenerate-payload checks only read prose, so a
+    doc that legitimately quotes `$(cat ...)` or `__A_TOKEN__` passes."""
+    fence_char, fence_len = "", 0
+    for i, line in enumerate(content.split("\n"), start=1):
+        fm = _FENCE_RE.match(line)
+        if fm:
+            marker = fm.group(1)
+            if not fence_char:
+                fence_char, fence_len = marker[0], len(marker)
+            elif marker[0] == fence_char and len(marker) >= fence_len:
+                fence_char, fence_len = "", 0
+            continue
+        if fence_char:
+            continue
+        yield i, _KB_INLINE_CODE_RE.sub("", line)
+
+
+def _kb_reject_degenerate_content(content: str, operation: str) -> None:
+    """Refuse payloads that are obviously not the document they claim to be:
+    empty/whitespace bodies, unexpanded shell substitutions, placeholder tokens.
+    Raises ValueError (both at preview and confirm, so callers learn early)."""
+    stripped = content.strip()
+    if not stripped:
+        raise ValueError(
+            f"Refusing {operation}: content is empty/whitespace — that is a doc wipe, not a "
+            "write. Pass the full document text; there is no sanctioned KB delete path."
+        )
+    if _KB_SUBSTITUTION_PAYLOAD_RE.match(stripped):
+        raise ValueError(
+            f"Refusing {operation}: content is a single unexpanded shell substitution "
+            f"({stripped[:80]!r}). MCP arguments are never shell-expanded — read the file "
+            "yourself and pass its literal text as content."
+        )
+    for line_no, prose in _kb_prose_lines(content):
+        if _KB_CAT_SUBSTITUTION_RE.search(prose):
+            raise ValueError(
+                f"Refusing {operation}: line {line_no} contains an unexpanded shell file "
+                "substitution ('$(cat ...' / '$(< ...'). MCP arguments are never "
+                "shell-expanded; pass the literal text. If the doc genuinely quotes this "
+                "syntax, put it in inline code or a fenced block."
+            )
+        placeholder = None
+        m = _KB_PLACEHOLDER_TOKEN_RE.search(prose)
+        if m:
+            placeholder = m.group(0)
+        elif _KB_PLACEHOLDER_LINE_RE.match(prose.strip()):
+            placeholder = prose.strip()
+        if placeholder:
+            raise ValueError(
+                f"Refusing {operation}: line {line_no} carries the placeholder token "
+                f"{placeholder!r} — the payload was never fully written out. Expand it to "
+                "the real text, or wrap it in inline code/a fenced block if the doc "
+                "genuinely documents that token."
+            )
+
+
+def _kb_reject_unacknowledged_shrink(existing: str, content: str, allow_shrink: bool) -> None:
+    """Refuse a full-file overwrite dramatically smaller than the existing doc
+    unless allow_shrink=True — the 2026-07-26 incident shape (394 lines -> 26)
+    reached the tree because nothing measured the payload against the doc."""
+    old_len = len(existing.strip())
+    new_len = len(content.strip())
+    if allow_shrink or old_len < _KB_SHRINK_MIN_CHARS or new_len * _KB_SHRINK_RATIO >= old_len:
+        return
+    pct = round(100.0 * new_len / old_len, 1) if old_len else 0.0
+    raise ValueError(
+        f"Refusing update_kb_doc: replacement content is {new_len} chars against an existing "
+        f"{old_len}-char doc ({pct}% of the original). update_kb_doc is a FULL-FILE "
+        "overwrite; a payload this much smaller is usually a truncated or partial document. "
+        "Use replace_kb_section/append_kb_doc for partial edits, or pass allow_shrink=True "
+        "if replacing the doc with a much shorter one is intended."
+    )
+
+
 @mcp.tool()
 def create_kb_doc(path: str, content: str, confirm: bool = False, commit: bool = True) -> dict[str, Any]:
-    """Create a markdown document under services/docs/kb/ via Atlas.
+    """Create a markdown document under the configured KB doc root via Atlas.
 
     Single sanctioned KB write path. Uses propose-confirm by default.
-    Set confirm=True to apply the write.
+    Set confirm=True to apply the write. Degenerate payloads (empty/whitespace,
+    unexpanded $(...) substitutions, __PLACEHOLDER__ tokens) are refused.
     """
     rel, target = _resolve_kb_rel_path(path)
     if not _is_allowed_kb_write(rel):
@@ -3209,6 +3014,7 @@ def create_kb_doc(path: str, content: str, confirm: bool = False, commit: bool =
             "KB write path is not allowed by policy. "
             "Allowed: root canonical docs or Projects/<Project>/<NN-STAGE>/<file>.md"
         )
+    _kb_reject_degenerate_content(content, "create_kb_doc")
 
     exists = target.exists()
     after_hash = _sha256_text(content)
@@ -3262,11 +3068,16 @@ def create_kb_doc(path: str, content: str, confirm: bool = False, commit: bool =
 
 
 @mcp.tool()
-def update_kb_doc(path: str, content: str, confirm: bool = False, commit: bool = True) -> dict[str, Any]:
-    """Update a markdown document under services/docs/kb/ via Atlas.
+def update_kb_doc(path: str, content: str, confirm: bool = False, commit: bool = True,
+                  allow_shrink: bool = False) -> dict[str, Any]:
+    """Update a markdown document under the configured KB doc root via Atlas.
 
     Single sanctioned KB write path. Uses propose-confirm by default.
-    Set confirm=True to apply the write.
+    Set confirm=True to apply the write. This is a FULL-FILE overwrite:
+    degenerate payloads (empty/whitespace, unexpanded $(...) substitutions,
+    __PLACEHOLDER__ tokens) are refused, and content dramatically smaller than
+    the existing doc is refused unless allow_shrink=True. For partial edits
+    prefer replace_kb_section/append_kb_doc.
     """
     rel, target = _resolve_kb_rel_path(path)
     if not _is_allowed_kb_write(rel):
@@ -3277,6 +3088,9 @@ def update_kb_doc(path: str, content: str, confirm: bool = False, commit: bool =
 
     if not target.exists() or not target.is_file():
         raise FileNotFoundError(f"KB doc not found: {rel.as_posix()}")
+
+    _kb_reject_degenerate_content(content, "update_kb_doc")
+    _kb_reject_unacknowledged_shrink(target.read_text(encoding="utf-8"), content, allow_shrink)
 
     before_hash = _sha256_file(target)
     after_hash = _sha256_text(content)
@@ -3388,10 +3202,12 @@ def _kb_append_text(text: str, content: str) -> str:
     return f"{base}\n\n{body}\n" if base else f"{body}\n"
 
 
-def _kb_replace_section_text(text: str, anchor: str, new_body: str, create_missing: bool) -> str:
+def _kb_replace_section_text(text: str, anchor: str, new_body: str, create_missing: bool,
+                             allow_whole_file: bool = False) -> str:
     """Replace the body of the section whose heading matches `anchor` (heading
     kept, replaced up to the next heading of same-or-shallower depth). Raises
-    ValueError on a missing (unless create_missing) or ambiguous anchor."""
+    ValueError on a missing (unless create_missing) or ambiguous anchor, or on a
+    whole-file overwrite (H1 anchor running to EOF) unless allow_whole_file."""
     lines = text.split("\n")
     headings = _find_md_headings(lines)
     norm = anchor.lstrip("#").strip()
@@ -3418,6 +3234,26 @@ def _kb_replace_section_text(text: str, anchor: str, new_body: str, create_missi
         if lvl2 <= level:
             end = idx2
             break
+
+    # Whole-file-overwrite guard. The doc's leading H1 (its title) with no
+    # same-or-shallower heading after it "owns" everything from the title to EOF,
+    # so replacing its body discards the whole document. That is not a section
+    # edit, and on 2026-07-26 it silently cut a 394-line KB doc to 26 lines
+    # (recovered from git). Deliberately narrow so real section edits still work:
+    # H2+ anchors are never affected (their span ends at the next H1/H2), and in a
+    # multi-H1 doc a later H1 only owns its own tail, not the file.
+    first_h1 = not any(lvl == 1 for (_i2, lvl, _t) in headings[:matches[0]])
+    if level == 1 and first_h1 and end == len(lines) and not allow_whole_file:
+        swallowed = [t for (_i2, _l2, t) in headings[matches[0] + 1:]]
+        detail = f", including subsection(s) {swallowed}" if swallowed else ""
+        raise ValueError(
+            f"Refusing whole-file overwrite: anchor {norm!r} is an H1 whose section runs to "
+            f"end of document (lines {hidx + 1}-{len(lines)} of {len(lines)}{detail}). "
+            "Replacing its body would discard the entire document below the title. "
+            "Anchor a deeper (H2+) heading to edit one section, use append_kb_doc to add "
+            "content, or pass allow_whole_file=True if replacing the whole body is intended."
+        )
+
     new_block = [lines[hidx], "", *body.split("\n"), ""]
     new_lines = lines[:hidx] + new_block + lines[end:]
     return "\n".join(new_lines).rstrip("\n") + "\n"
@@ -3506,7 +3342,8 @@ def append_kb_doc(path: str, content: str, expected_hash: str = "",
 
 @mcp.tool()
 def replace_kb_section(path: str, anchor: str, content: str, create_missing: bool = False,
-                       expected_hash: str = "", confirm: bool = False, commit: bool = True) -> dict[str, Any]:
+                       expected_hash: str = "", confirm: bool = False, commit: bool = True,
+                       allow_whole_file: bool = False) -> dict[str, Any]:
     """Replace one markdown section's body in a KB doc, leaving the rest intact.
 
     `anchor` is the heading text (with or without leading #). The matched heading
@@ -3517,11 +3354,15 @@ def replace_kb_section(path: str, anchor: str, content: str, create_missing: boo
     - anchor not found -> error listing available headings, unless
       create_missing=True (then a new `## anchor` section is appended).
     - anchor matches >1 heading -> error with line numbers (disambiguate).
+    - anchor is an H1 whose section runs to end of document -> refused, because
+      that replaces the whole doc, not a section. Anchor an H2+ heading instead,
+      or pass allow_whole_file=True if you really mean to replace everything
+      below the title.
     expected_hash: optional optimistic guard (see append_kb_doc).
     Propose-confirm: call with confirm=True to apply.
     """
     rel, target = _kb_resolve_existing(path)
-    compute = lambda t: _kb_replace_section_text(t, anchor, content, create_missing)
+    compute = lambda t: _kb_replace_section_text(t, anchor, content, create_missing, allow_whole_file)
     if not confirm:
         return _kb_patch_preview(rel, target, "replace_kb_section", commit, compute)
     return _kb_patch_apply(target, rel, expected_hash, commit, "update", "replace_kb_section", compute)
@@ -3542,7 +3383,7 @@ def check_drift(service_id: str = "", force: bool = False) -> list[dict[str, Any
 
     Pass service_id to filter to one service; omit for all non-retired services.
     """
-    PROBE_CACHE = Path("outputs/state/atlas_probe_latest.json")
+    PROBE_CACHE = Path("/opt/stack/services/automations/state/atlas_probe_latest.json")
 
     if not force and PROBE_CACHE.exists() and not service_id:
         try:
@@ -3716,7 +3557,7 @@ if __name__ == "__main__":
 
         app.routes.insert(0, Route(_OAUTH_LOGIN_PATH, oauth_login, methods=["GET", "POST"]))
 
-        # P3 — keep 127.0.0.1 callers (loopback agents/automations) working by injecting a
+        # P3 — keep 127.0.0.1 callers (local automations) working by injecting a
         # stable local-agent bearer before the SDK's auth runs.
         _local_token = _atlas_oauth_provider.ensure_local_token()
 

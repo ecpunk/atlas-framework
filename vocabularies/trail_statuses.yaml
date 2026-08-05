@@ -2,10 +2,10 @@ id: trail_statuses
 name: Trail Statuses
 description: |
   Lifecycle states for "trails" — exploratory leads (noticed adjacencies between
-  ideas) surfaced by the consolidation loop.
+  ideas) surfaced by a consolidation loop.
 purpose: |
   Tracks a lead from first notice through a demand-gated pull to its resolution.
-  See the consolidation design notes.
+
 values:
   - id: open
     name: Open

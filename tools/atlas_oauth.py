@@ -39,17 +39,17 @@ from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 # Config (env-driven; all optional with sane defaults)
 # ---------------------------------------------------------------------------
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DB_PATH = Path(os.environ.get("ATLAS_OAUTH_DB", str(REPO_ROOT / "secrets" / "oauth.sqlite3")))
+DB_PATH = Path(os.environ.get("ATLAS_OAUTH_DB", str(REPO_ROOT / ".secrets" / "oauth.sqlite3")))
 ISSUER_URL = os.environ.get("ATLAS_OAUTH_ISSUER", "https://atlas-mcp.example.com").rstrip("/")
 RESOURCE_URL = os.environ.get("ATLAS_OAUTH_RESOURCE", ISSUER_URL).rstrip("/")
 LOGIN_PATH = os.environ.get("ATLAS_OAUTH_LOGIN_PATH", "/oauth/login")
-PRINCIPAL = os.environ.get("ATLAS_OAUTH_PRINCIPAL", "operator")
+PRINCIPAL = os.environ.get("ATLAS_OAUTH_PRINCIPAL", "jon")
 ACCESS_TTL = int(os.environ.get("ATLAS_OAUTH_ACCESS_TTL", str(60 * 60)))          # 1h
 REFRESH_TTL = int(os.environ.get("ATLAS_OAUTH_REFRESH_TTL", str(30 * 24 * 3600)))  # 30d
 CODE_TTL = int(os.environ.get("ATLAS_OAUTH_CODE_TTL", "300"))                      # 5m
 TICKET_TTL = int(os.environ.get("ATLAS_OAUTH_TICKET_TTL", "600"))                  # 10m
 _LOGIN_SECRET_FILE = os.environ.get(
-    "ATLAS_OAUTH_LOGIN_SECRET_FILE", str(REPO_ROOT / "secrets" / "oauth_login_secret.txt")
+    "ATLAS_OAUTH_LOGIN_SECRET_FILE", str(REPO_ROOT / ".secrets" / "oauth_login_secret.txt")
 )
 
 
@@ -280,7 +280,7 @@ class AtlasOAuthProvider(OAuthAuthorizationServerProvider):
 
     def ensure_local_token(self) -> str:
         """Return a stable, long-lived access token for local (127.0.0.1) agents, so
-        enabling OAuth doesn't break loopback callers (loopback agents, automations). Minted once
+        enabling OAuth doesn't break loopback callers (local automations). Minted once
         and reused; principal = the operator principal."""
         far = _now() + 10 * 365 * 24 * 3600
         with self._conn() as c:

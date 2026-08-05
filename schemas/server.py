@@ -24,6 +24,8 @@ class Server(BaseModel):
 
     os: Optional[str] = None
 
+    node_class: Optional[str] = None
+
     ram_committed_gib: Optional[float] = None
     ram_alert_floor_gib: Optional[float] = None
     swap_gib: Optional[float] = None

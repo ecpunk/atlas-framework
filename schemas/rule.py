@@ -65,8 +65,13 @@ class Rule(BaseModel):
         if self.fix_tier.value_id == "flag" and self.fix_action is not None:
             raise ValueError("fix_action must be null when fix_tier is vocab:rule_fix_tiers:flag")
 
-        if self.fix_tier.value_id in {"auto", "propose"}:
+        # 'block' is a hard stop — the vocabulary says "fix_action should provide exact
+        # remediation steps", and all existing block rules set one. It was omitted here,
+        # so a rule that halts work could be written with no way forward.
+        if self.fix_tier.value_id in {"auto", "propose", "block"}:
             if self.fix_action is None or not self.fix_action.strip():
-                raise ValueError("fix_action is required when fix_tier is auto or propose")
+                raise ValueError(
+                    "fix_action is required when fix_tier is auto, propose, or block"
+                )
 
         return self

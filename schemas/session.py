@@ -15,7 +15,7 @@ class Session(BaseModel):
     """Canonical operator session entity for mobile and chat control surfaces."""
 
     id: str = Field(..., min_length=1)
-    source: str = Field(default="telegram-bot", min_length=1)
+    source: str = Field(default="telegram-ops-bot", min_length=1)
     user_id: int
 
     timestamp: datetime

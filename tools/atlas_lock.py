@@ -16,7 +16,7 @@ The lock file lives inside `.git/` so it is never itself committed, and its path
 is derived purely from the repo root so every process agrees on the same lock.
 
 Scope note: adopters so far are mcp_server, remediate, and session_retention.
-Any future atlas-store committer (e.g. consolidator, generators) must
+Any future atlas-store committer (e.g. a consolidation loop, generators) must
 import and use this too, or it reopens the race for itself.
 """
 

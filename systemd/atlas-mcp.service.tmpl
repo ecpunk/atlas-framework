@@ -1,0 +1,35 @@
+[Unit]
+Description=Atlas MCP Read API (HTTP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__TARGET_USER__
+Group=__TARGET_GROUP__
+Environment=ATLAS_MCP_HOST=0.0.0.0
+Environment=ATLAS_MCP_PORT=__ATLAS_PORT__
+Environment=ATLAS_MCP_PATH=/mcp
+Environment=ATLAS_OAUTH_ENABLED=1
+Environment=ATLAS_OAUTH_ISSUER=__ATLAS_OAUTH_ISSUER__
+Environment=ATLAS_OAUTH_RESOURCE=__ATLAS_OAUTH_RESOURCE__
+Environment=ATLAS_OAUTH_PRINCIPAL=__ATLAS_OAUTH_PRINCIPAL__
+# KB docs live inside the instance's own store repo — without this the server
+# falls back to a source-estate path that does not exist on a fresh instance
+# and get_kb_doc fails with a confusing error.
+Environment=ATLAS_KB_DOC_ROOT=__ATLAS_REPO_ROOT__/docs/kb
+Environment=ATLAS_SERVICES_REPO_ROOT=__ATLAS_REPO_ROOT__
+# This instance's own host id — server entities created here reference it as
+# server:<id>; probes treat that id as "local".
+Environment=ATLAS_LOCAL_HOST_ID=__ATLAS_INSTANCE_NAME__
+# Per-instance routing prose appended to the server's base MCP instructions
+# (e.g. "read Start Here.md / How I Work.md first"). Safe to carry
+# unconditionally: an absent file is ignored by design in the engine that
+# reads this var, so it costs nothing before the instruction layer exists.
+Environment=ATLAS_MCP_INSTRUCTIONS_EXTRA_FILE=__ATLAS_REPO_ROOT__/mcp-instructions.md
+ExecStart=/bin/bash -lc 'exec __ATLAS_REPO_ROOT__/.venv/bin/python __ATLAS_REPO_ROOT__/tools/mcp_server.py'
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

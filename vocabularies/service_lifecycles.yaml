@@ -22,6 +22,32 @@ values:
     physical_location: null
     deprecated: false
     deprecated_reason: null
+  - id: planned
+    name: Planned
+    description: Service is designed and registered but not yet built or installed.
+    semantics: |
+      Nothing runs on the box yet. The entity exists so the thing is born
+      registered — it declares owns_units up front, which means the capability
+      ledger scores it UNKNOWN (Atlas lifecycle=planned) instead of reporting
+      its future units as UNREGISTERED the moment they appear. Distinct from
+      reserved (built, deliberately stopped) and retired (built, gone for
+      good): planned has never run. Flip to running when the units are
+      installed and enabled.
+    physical_location: null
+    deprecated: false
+    deprecated_reason: null
+  - id: reserved
+    name: Reserved
+    description: Service is intentionally stopped but held for future use.
+    semantics: |
+      Container stopped and set not to auto-start on boot; excluded from
+      down-alerts (listed in the audit's containers_allowed_stopped) because its
+      absence is deliberate, not a fault. Data/backups retained so it can be
+      restored. Distinct from retired (gone for good) and degraded
+      (running-but-impaired). Restore with automations/scripts/restore_service.sh.
+    physical_location: null
+    deprecated: false
+    deprecated_reason: null
   - id: degraded
     name: Degraded
     description: Service is active but known to be impaired.

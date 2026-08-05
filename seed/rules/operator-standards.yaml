@@ -1,0 +1,44 @@
+id: operator-standards
+name: Operator Standards
+description: |
+  Canonical floors for QC, grading, alerting, docs, code, control-panel
+  ownership, and agent question behavior. If this store has an Operator
+  Standards KB doc authored by the operator, that doc is canonical and this
+  rule is a pointer and minimal enforcement gate on top of it — it does not
+  duplicate the doc's content. Until such a doc exists, the generic floors
+  below apply directly.
+
+  Generic floors:
+  - Every authored prompt or dictated task spec that will fan out agents
+    states a quality bar (e.g. "bar: low/medium/high") appropriate to the
+    deliverable.
+  - Every task created carries a closure_test phrased from the requester's
+    vantage point — the real access path they will use to check the result —
+    not the internal component's vantage point.
+  - Pre-build: when intent is clearly stated, the agent derives its own
+    acceptance test and verifies the plan against that stated intent before
+    building.
+  - Post-build: the agent verifies the result against the closure_test from
+    the requester's vantage (the real access path, not localhost/source-only
+    checks).
+scope: vocab:rule_scopes:agent_behavior
+severity: vocab:rule_severities:error
+applies_to: agent_behavior:all_sessions
+check_kind: vocab:rule_check_kinds:process_gate
+check_definition: |
+  Every authored prompt or dictated task spec that will fan out agents names
+  a "bar: <level>" (level = low/medium/high per whatever deliverable-class
+  grading the operator has defined, in the Operator Standards KB doc if one
+  exists). Every Atlas task created carries a closure_test phrased from the
+  requester's vantage, not the component's.
+fix_tier: vocab:rule_fix_tiers:flag
+fix_action: null
+enforcement_point: vocab:enforcement_points:all
+on_violation: |
+  Flag the missing bar-level or closure_test and point the author at the
+  Operator Standards KB doc (if one exists) to fill it in — do not block, and
+  do not restate the doc's content inline; read the doc for the grading
+  definitions and vantage standard.
+authored_by: atlas-mcp
+created_at: '2026-08-01T02:53:31Z'
+updated_at: '2026-08-01T02:56:35Z'

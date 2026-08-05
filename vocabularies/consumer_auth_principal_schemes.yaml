@@ -29,8 +29,8 @@ values:
     physical_location: null
     deprecated: false
     deprecated_reason: null
-  - id: internal-hydra-alert-pipeline
-    name: Internal Hydra Alert Pipeline
+  - id: internal-alert-pipeline
+    name: Internal Alert Pipeline
     description: Internal non-human monitoring pipeline principal.
     semantics: |
       Used for signal ingest profile with read-only authority.

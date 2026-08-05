@@ -2,17 +2,17 @@ id: memory_types
 name: Memory Types
 description: |
   Functional types for consolidated memories promoted from the Substrate
-  episodic floor into Atlas by the consolidation loop.
+  episodic floor into Atlas by a consolidation loop.
 purpose: |
   Projects a stabilized episodic pattern into the functional form the moment
   needs — the same insight as Substrate's single-store-many-projections model,
-  one zoom level out. See the consolidation design notes.
+  one zoom level out.
 values:
   - id: identity
     name: Identity
     description: Who the operator is — role, context, durable facts about the person.
     semantics: |
-      Stable self-facts ("the operator founded Example Co"; "operates a Hydra homelab").
+      Stable self-facts (role, history, durable context).
     physical_location: null
     deprecated: false
     deprecated_reason: null

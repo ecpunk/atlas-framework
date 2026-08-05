@@ -11,10 +11,10 @@ from .conventions import VocabRef, validate_iso8601_timestamp
 class Trail(BaseModel):
     """An exploratory lead — a noticed adjacency between two ideas/clusters.
 
-    The divergent arrow of the consolidation loop: a bridge between
+    The divergent arrow of a consolidation loop: a bridge between
     themes that keep landing near each other. Inert until pulled (demand-gated);
     a pull spawns a bounded, focused look that may yield a memory, project, or new
-    trails. See the consolidation design notes.
+    trails.
     """
 
     id: str = Field(..., min_length=1)

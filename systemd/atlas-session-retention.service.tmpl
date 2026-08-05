@@ -1,0 +1,13 @@
+[Unit]
+Description=Atlas session retention sweep (archive + prune per retention_days)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=__TARGET_USER__
+Group=__TARGET_GROUP__
+Environment=HOME=__TARGET_HOME__
+WorkingDirectory=__ATLAS_REPO_ROOT__
+ExecStart=__ATLAS_REPO_ROOT__/.venv/bin/python __ATLAS_REPO_ROOT__/tools/session_retention_sweep.py
+StandardOutput=journal
+StandardError=journal

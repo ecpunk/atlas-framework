@@ -1,0 +1,52 @@
+id: project-scope-discipline
+name: Project Scope Discipline
+description: |
+  Projects must be scoped to the problem they solve, not the capability
+  they could have. Two gates:
+
+  INTAKE GATE (at project creation / concept authoring):
+  - State the problem in one sentence.
+  - Identify the cheapest credible solution to that problem.
+  - Any requirement beyond the cheapest credible solution must justify itself
+    against a CURRENT need. Requirements that exist to serve a parked,
+    deferred, or concept-status project do not count as justification.
+
+  RE-BASELINE CHECK (during project life, event-triggered — not calendar-based):
+  Triggers: (a) first dollar about to be spent, (b) first build action about
+  to be taken, (c) any session that adds scope to a concept-status project,
+  (d) scope growth on a project that is blocked (especially blocked on cost).
+
+  Check: does the ORIGINAL one-sentence problem statement still require
+  everything now in the plan? Any requirement added after intake is
+  re-argued from zero, not grandfathered. Scope added while a project is
+  blocked on cost is presumptively part of what maintains the block.
+
+  Rationale: scope creep on a small, well-understood problem is how a cheap
+  fix quietly becomes an expensive, stalled project — one that never gets
+  built because it grew past what the original problem justified.
+scope: vocab:rule_scopes:agent_behavior
+severity: vocab:rule_severities:error
+applies_to: agent_session
+check_kind: vocab:rule_check_kinds:process_gate
+check_definition: |
+  At project creation: concept must contain a one-sentence problem
+  statement, the cheapest credible solution, and current-need justification
+  for every requirement beyond it. At re-baseline triggers (first spend,
+  first build action, scope added to concept-status or blocked project):
+  verify the original problem statement still requires the full current
+  plan; post-intake requirements are re-argued from zero.
+fix_tier: vocab:rule_fix_tiers:block
+fix_action: |
+  Stop. Restate the original one-sentence problem. List every requirement
+  in the current plan and mark each as: (a) required by the original
+  problem, (b) justified by a current need, or (c) justified only by a
+  parked/deferred/concept project or speculative future use. Strip or
+  explicitly re-argue category (c) items with the operator before
+  proceeding with spend or build.
+enforcement_point: vocab:enforcement_points:pre_action
+on_violation: |
+  Block the spend/build/scope-add action. Run the re-baseline check and
+  surface the requirement audit to the operator before continuing.
+authored_by: operator
+created_at: '2026-07-13T17:18:06Z'
+updated_at: '2026-07-13T17:18:06Z'

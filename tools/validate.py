@@ -19,6 +19,7 @@ from pydantic import BaseModel
 from schemas.conventions import TypedRef, VocabRef
 from schemas.project import Project
 from schemas.vocabulary import Vocabulary
+from tools.refs import build_ref_index, check_refs, iter_refs
 
 
 @dataclass
@@ -61,52 +62,26 @@ def _iter_yaml_files(root: Path) -> list[Path]:
     )
 
 
-def _iter_refs(obj: Any) -> tuple[list[TypedRef], list[VocabRef]]:
-    typed: list[TypedRef] = []
-    vocab: list[VocabRef] = []
-
-    def walk(value: Any) -> None:
-        if isinstance(value, TypedRef):
-            typed.append(value)
-            return
-        if isinstance(value, VocabRef):
-            vocab.append(value)
-            return
-        if isinstance(value, BaseModel):
-            for field_value in value.__dict__.values():
-                walk(field_value)
-            return
-        if isinstance(value, dict):
-            for field_value in value.values():
-                walk(field_value)
-            return
-        if isinstance(value, (list, tuple, set)):
-            for item in value:
-                walk(item)
-
-    walk(obj)
-    return typed, vocab
-
-
 def _validate_references(loaded_docs: list[LoadedDocument], repo_root: Path) -> tuple[int, int]:
+    """Resolve every ref in every loaded doc. Delegates to tools/refs.py, which is
+    the single implementation shared with the MCP write path (mcp_server.py's
+    _validate_entity) so the validator and the write gate cannot drift apart.
+    """
     warnings = 0
     failures = 0
 
-    entity_refs: set[str] = set()
-    vocab_values: dict[str, set[str]] = {}
-
+    # refs.build_ref_index consumes a Store; reshape the LoadedDocument list into one.
+    store: dict[str, dict[str, BaseModel]] = {}
     for doc in loaded_docs:
-        if doc.kind == "vocabulary" and isinstance(doc.model, Vocabulary):
-            vocab_values[doc.model.id] = {item.id for item in doc.model.values}
-            continue
-
         model_id = getattr(doc.model, "id", None)
         if isinstance(model_id, str) and model_id:
-            entity_refs.add(f"{doc.kind}:{model_id}")
+            store.setdefault(doc.kind, {})[model_id] = doc.model
+
+    entity_refs, vocab_values = build_ref_index(store)
 
     for doc in loaded_docs:
-        typed_refs, vocab_refs = _iter_refs(doc.model)
         rel = doc.path.relative_to(repo_root)
+        typed_refs, vocab_refs = iter_refs(doc.model)
 
         for typed_ref in typed_refs:
             rendered = str(typed_ref)

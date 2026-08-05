@@ -62,10 +62,10 @@ values:
     description: Service runs as a Cloudflare Worker on the CF edge network.
     semantics: |
       Deployed via wrangler to Cloudflare's global edge. No host, port, or
-      deployment_path in the Hydra sense. deployment_path holds the worker_name.
+      deployment_path in the local-host sense. deployment_path holds the worker_name.
       May bind R2 buckets, D1 databases, KV namespaces, and Durable Objects.
       Auth pattern is one of: cloudflare_access, byo, none, hybrid.
-      Drift probes use the CF API rather than Hydra health endpoints.
+      Drift probes use the CF API rather than local health endpoints.
     physical_location: cloudflare
     deprecated: false
     deprecated_reason: null
@@ -79,6 +79,21 @@ values:
     physical_location: cloudflare
     deprecated: false
     deprecated_reason: null
+  - id: cli_tool
+    name: Manual CLI Tool
+    description: Hand-run script or utility with no daemon, container, or HTTP
+      surface -- invoked on demand by an operator or agent, not by systemd/cron.
+    semantics: |
+      No owns_units (nothing to restart or alert on), no port, no health
+      endpoint in the daemon sense. Distinct from systemd_unit (which implies
+      scheduled/supervised execution) even though both may be plain Python
+      files: a cli_tool is only ever started manually. Existence and freshness
+      are the only meaningful checks; use lifecycle=maintained for tools kept
+      deployable and periodically verified, running only if truly invoked in
+      an ongoing loop by a human.
+    physical_location: null
+    deprecated: false
+    deprecated_reason: null
 extension_policy: open
 created_at: 2026-05-08T01:21:06Z
-updated_at: 2026-05-26T23:00:00Z
+updated_at: 2026-07-30T22:30:00Z

@@ -13,11 +13,11 @@ _MEMORY_STATUSES = {"active", "superseded"}
 class Memory(BaseModel):
     """A consolidated memory promoted from the Substrate episodic floor into Atlas.
 
-    Produced by the consolidation loop: a stabilized, recurring
+    Produced by a consolidation loop: a stabilized, recurring
     episodic pattern synthesized into one durable statement and projected into a
     functional type. Reversible — a contradicting later memory supersedes it
     (status='superseded' + superseded_by) rather than deleting it.
-    See the consolidation design notes.
+
     """
 
     id: str = Field(..., min_length=1)

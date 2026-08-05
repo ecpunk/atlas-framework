@@ -39,6 +39,28 @@ class OverridePolicyBoundaries(BaseModel):
 
 
 class ConsumerProfile(BaseModel):
+    """A consumer-profile entity is DESCRIPTIVE DOCUMENTATION, not an access-control
+    surface. It records the intended entitlement for a caller class (allowed_action_tiers,
+    autopilot_eligibility, tool_scope, confirm_channel, etc.) so humans and generators
+    have one canonical place to read "what is this caller supposed to be allowed to do."
+
+    It enforces NOTHING by itself: there is no middleware, gate, or deny path in this
+    codebase that reads a ConsumerProfile at authorization time and blocks a call because
+    a field says so. The only consumers of allowed_action_tiers/tool_scope today are a
+    docs generator (generators/consumer_profiles_index.py) and MCP tools that echo the
+    fields back for display. A revoked, absent, or wrong profile does not stop any actual
+    action from happening; whatever enforcement exists for a given caller lives in that
+    caller's own code path (e.g. runtime_gate.decide()/decide_for() consulting a profile
+    dict as ONE input among several — decide() itself is the enforcement point, not this
+    schema).
+
+    Decided 2026-07-30 (Atlas task atlas-decide-whether-consumer--20260713164034): if a
+    real enforcement gate is ever wanted, that is new work (a middleware that fails
+    closed on a missing/revoked grant) — not implied by this schema's existence. Until
+    then, treat every field here as a claim about intent, never a guarantee about what a
+    caller can actually do.
+    """
+
     id: str = Field(..., min_length=1)
     display_name: str = Field(..., min_length=1)
 
