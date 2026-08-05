@@ -25,7 +25,10 @@ cd /opt/stack/atlas-store
 
 `bootstrap.sh` checks prerequisites, builds a private virtualenv, seeds the
 store, generates a login secret (printed exactly once — store it), installs
-and starts the systemd units, and health-checks the result. It is idempotent:
+and starts the systemd units, and health-checks the result. On a brand-new
+install, the first run may pause for up to half an hour while the system
+finishes its own first-boot updates — it says so on screen when that
+happens; just let it sit. It is idempotent:
 re-run it after any failure and it picks up where it stopped. `./bootstrap.sh
 --help` lists the options. When it finishes, it prints the next steps
 (installing Claude Code, connecting from your phone/browser).
