@@ -74,7 +74,7 @@ Validate the store at any time with:
 
 ```
 cd /opt/stack/atlas-store
-git pull
+git pull --no-edit
 ./bootstrap.sh
 sudo systemctl restart atlas-mcp
 ```

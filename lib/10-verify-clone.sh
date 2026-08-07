@@ -38,4 +38,11 @@ fi
 git config pull.rebase false
 log "pull.rebase=false set — future 'git pull' upgrades merge over local store commits"
 
+# A pull that merges over local store commits would otherwise drop the owner
+# into an editor for the merge message — not something a non-technical owner
+# should ever see (observed live on the 2026-08-07 tc2 round).
+BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+git config "branch.${BRANCH}.mergeoptions" "--no-edit"
+log "branch.${BRANCH}.mergeoptions=--no-edit set — upgrade merges never open an editor"
+
 log "clone verified: $(head -n1 VERSION)"
