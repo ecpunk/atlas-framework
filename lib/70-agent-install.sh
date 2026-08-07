@@ -54,6 +54,7 @@ install_claude() {
     log "added ~/.local/bin to PATH in ~/.bashrc (new shells pick it up)"
   fi
 
+  log "if the installer printed a note above about PATH — ignore it, that is already handled; reconnecting your SSH window picks it up"
   log "Claude Code installed"
 }
 

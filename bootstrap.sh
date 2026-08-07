@@ -126,7 +126,10 @@ done
 [ "$DRY_RUN" -eq 1 ] && exit 0
 [ -n "$ONLY_PHASE" ] && exit 0
 
-cat <<EOF
+# Printed AND saved to a file — the agent's first-run screens clear the
+# terminal, and these instructions must survive that (learned live: the
+# owner lost them to the TUI and had nothing to work from).
+tee "$REPO_ROOT/NEXT_STEPS.txt" <<EOF
 
 ==========================================================================
  Your Atlas is up. Two steps left, then you're done with commands:
@@ -139,6 +142,9 @@ cat <<EOF
     The first run logs you in, screen by screen:
       - It may first ask you to "Choose the text style" — just press
         Enter.
+      - It may offer other display options (like a "flicker-free"
+        mode) — any answer is fine; these screens change with agent
+        updates, and none of them affect your setup.
       - "Select login method" — choose 1, "Claude account with
         subscription", and press Enter.
       - It shows a long web link and waits for a code. Click the link
@@ -156,5 +162,11 @@ cat <<EOF
  phone, backups, or fixing something that breaks — you just ask the
  agent for in plain words. It knows how, and it does the technical
  parts itself.
+
+ Good to know: leave the agent by typing /exit — that brings your
+ normal prompt back. Close the SSH window afterwards by typing exit.
+
+ This message is saved as NEXT_STEPS.txt in this folder. If the screen
+ gets cleared, bring it back with:  cat NEXT_STEPS.txt
 ==========================================================================
 EOF
