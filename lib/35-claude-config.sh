@@ -27,14 +27,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/_common.sh"
 
 RESYNC=0
+PORT=8105
 while [ $# -gt 0 ]; do
   case "$1" in
     --resync-claude-md) RESYNC=1; shift ;;
+    --port) PORT="$2"; shift 2 ;;
     *) die "unrecognized argument: $1" ;;
   esac
 done
 
-banner "Installing Claude config (~/.claude/CLAUDE.md)"
+banner "Installing Claude config (~/.claude/CLAUDE.md + local MCP wiring)"
 
 cd "$REPO_ROOT"
 FIXTURE="fixtures/claude/CLAUDE.md"
@@ -60,6 +62,44 @@ install_it() {
     printf '%s\n' "$fixture_hash"
   } > "$MARKER"
 }
+
+# ---- Local MCP wiring: sessions started in this folder get the instance's
+# own Atlas automatically (project-scope .mcp.json; loopback needs no auth —
+# the server injects a local token for 127.0.0.1 callers). Merge-not-clobber:
+# other entries the owner/agent adds later are preserved.
+PORT="$PORT" python3 - "$REPO_ROOT" <<'PY'
+import json, os, sys
+root = sys.argv[1]
+port = os.environ["PORT"]
+
+mcp_path = os.path.join(root, ".mcp.json")
+cfg = {}
+if os.path.exists(mcp_path):
+    try:
+        cfg = json.load(open(mcp_path))
+    except Exception:
+        cfg = {}
+cfg.setdefault("mcpServers", {})["atlas"] = {
+    "type": "http",
+    "url": f"http://127.0.0.1:{port}/mcp",
+}
+json.dump(cfg, open(mcp_path, "w"), indent=2)
+
+settings_dir = os.path.join(root, ".claude")
+os.makedirs(settings_dir, exist_ok=True)
+settings_path = os.path.join(settings_dir, "settings.json")
+settings = {}
+if os.path.exists(settings_path):
+    try:
+        settings = json.load(open(settings_path))
+    except Exception:
+        settings = {}
+enabled = settings.setdefault("enabledMcpjsonServers", [])
+if "atlas" not in enabled:
+    enabled.append("atlas")
+json.dump(settings, open(settings_path, "w"), indent=2)
+PY
+log "local Atlas MCP wired for sessions in $REPO_ROOT (.mcp.json -> 127.0.0.1:$PORT, pre-approved in .claude/settings.json)"
 
 if [ -z "$current_hash" ]; then
   install_it

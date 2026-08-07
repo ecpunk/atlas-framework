@@ -93,7 +93,7 @@ phase_command() {
     20) CMD=("$LIB/20-venv-deps.sh") ;;
     30) CMD=("$LIB/30-seed-store.sh")
         if [ "$RESEED" -eq 1 ]; then CMD+=(--reseed); fi ;;
-    35) CMD=("$LIB/35-claude-config.sh")
+    35) CMD=("$LIB/35-claude-config.sh" --port "$PORT")
         if [ "$RESYNC_CLAUDE_MD" -eq 1 ]; then CMD+=(--resync-claude-md); fi ;;
     40) CMD=("$LIB/40-oauth-secrets.sh") ;;
     50) CMD=("$LIB/50-systemd-units.sh" --principal "$PRINCIPAL" --issuer "$ISSUER" \
@@ -134,11 +134,13 @@ tee "$REPO_ROOT/NEXT_STEPS.txt" <<EOF
 ==========================================================================
  Your Atlas is up. Two steps left, then you're done with commands:
 
- 1. Start your agent — in your SSH window, type:
+ 1. Start your agent — in your SSH window, type these two lines:
+      cd /opt/stack/atlas-store
       claude
-    (If that says "command not found", close the SSH window, connect
-    again, and retry — the install landed in a folder your login
-    predates.)
+    Starting it in this folder matters — that's where it finds your
+    Atlas. (If claude says "command not found", close the SSH window,
+    connect again, and retry — the install landed in a folder your
+    login predates.)
     The first run logs you in, screen by screen:
       - It may first ask you to "Choose the text style" — just press
         Enter.
