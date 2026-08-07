@@ -137,6 +137,8 @@ cat <<EOF
     again, and retry — the install landed in a folder your login
     predates.)
     The first run logs you in, screen by screen:
+      - It may first ask you to "Choose the text style" — just press
+        Enter.
       - "Select login method" — choose 1, "Claude account with
         subscription", and press Enter.
       - It shows a long web link and waits for a code. Click the link
