@@ -45,6 +45,15 @@ install_claude() {
     die "install script ran but no 'claude' binary was found (checked PATH and ~/.local/bin) — run it yourself: curl -fsSL https://claude.ai/install.sh | bash (check https://docs.claude.com if that command has changed)"
   fi
 
+  # The installer lands in ~/.local/bin, which ~/.profile only adds to PATH
+  # when the dir existed at login — a fresh box's first session misses it
+  # (observed live on the 2026-08-07 tc2 round). Make the NEXT shell right.
+  if ! command -v claude >/dev/null 2>&1 \
+     && ! grep -q '\.local/bin' "$HOME/.bashrc" 2>/dev/null; then
+    printf '\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$HOME/.bashrc"
+    log "added ~/.local/bin to PATH in ~/.bashrc (new shells pick it up)"
+  fi
+
   log "Claude Code installed"
 }
 
