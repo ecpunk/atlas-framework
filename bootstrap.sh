@@ -131,8 +131,13 @@ cat <<EOF
 ==========================================================================
  Your Atlas is up. Two steps left, then you're done with the terminal:
 
- 1. Start your agent and log in with your own Claude account:
+ 1. Start your agent:
       claude
+    The first run walks you through logging in. Choose the "Claude
+    account" option (your own subscription, not Console). This machine
+    has no browser, so it prints a link — open that link on your phone
+    or any computer, log in there, and paste the code it gives you back
+    into this terminal.
 
  2. In that first session, type:
       Read "Start Here.md" and introduce yourself.
