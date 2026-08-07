@@ -16,6 +16,10 @@ anywhere.
 
 ## Quick start (fresh Ubuntu box)
 
+Run these in the SSH window on your own computer (see the install guide's
+"Switch to your own computer" section) — not at the machine's own keyboard.
+Copy and paste them one at a time:
+
 ```
 sudo mkdir -p /opt/stack && sudo chown "$USER" /opt/stack
 git clone https://github.com/ecpunk/atlas-framework.git /opt/stack/atlas-store

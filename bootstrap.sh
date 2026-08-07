@@ -129,18 +129,23 @@ done
 cat <<EOF
 
 ==========================================================================
- Your Atlas is up. Two steps left, then you're done with the terminal:
+ Your Atlas is up. Two steps left, then you're done with commands:
 
- 1. Start your agent:
+ 1. Start your agent — in your SSH window, type:
       claude
-    (If that says "command not found", log out and back in once — the
-    install landed in a folder your current login predates — then run
-    it again.)
-    The first run walks you through logging in. Choose the "Claude
-    account" option (your own subscription, not Console). This machine
-    has no browser, so it prints a link — open that link on your phone
-    or any computer, log in there, and paste the code it gives you back
-    into this terminal.
+    (If that says "command not found", close the SSH window, connect
+    again, and retry — the install landed in a folder your login
+    predates.)
+    The first run logs you in, screen by screen:
+      - "Select login method" — choose 1, "Claude account with
+        subscription", and press Enter.
+      - It shows a long web link and waits for a code. Click the link
+        (hold Ctrl and click in most terminals), or copy and paste it
+        into your browser. Log in with your Claude account there.
+      - The browser hands you a code — copy it, paste it back into
+        this terminal, press Enter.
+      - A couple of confirmation screens follow (security notes, and
+        whether to trust this folder) — accept them.
 
  2. In that first session, type:
       Read "Start Here.md" and introduce yourself.
