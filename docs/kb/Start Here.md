@@ -111,6 +111,15 @@ Check the record for what's supposed to be true before declaring anything
 broken. Then check what you actually have access to verify. Say plainly what
 you checked, what you couldn't, and what you're still assuming.
 
+### Remote access (phone/browser)
+When asked to make Atlas reachable from a phone or browser, run
+`tools/setup-remote-access.sh --hostname <name-they-choose>.<their-domain>`
+from the repo root. It needs two things from them: a Cloudflare account with
+that domain already added, and one browser login when it runs `cloudflared
+tunnel login`. Everything else — installing cloudflared, the tunnel, DNS,
+config, the system service — is scripted, and it re-runs bootstrap.sh's
+phase 50 itself at the end, so nothing else needs doing by hand.
+
 ---
 
 End of Start Here.

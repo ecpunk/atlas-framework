@@ -21,6 +21,8 @@
 #   50  systemd-units  render + install + enable atlas-mcp and the retention
 #                      timer (the one phase that needs sudo)
 #   60  verify-local   health checks against localhost
+#   70  agent-install  install the coding agent (Claude Code by default;
+#                      pluggable via ATLAS_AGENT)
 #
 # Everything is idempotent: re-running bootstrap.sh after a failure re-does
 # the finished phases quickly (skips/no-ops) and picks up where it stopped.
@@ -81,7 +83,7 @@ if [ -z "$ISSUER" ]; then
 fi
 [ -n "$RESOURCE" ] || RESOURCE="$ISSUER"
 
-ALL_PHASES=(00 10 20 30 35 40 50 60)
+ALL_PHASES=(00 10 20 30 35 40 50 60 70)
 
 phase_command() {
   local phase="$1"
@@ -97,6 +99,7 @@ phase_command() {
     50) CMD=("$LIB/50-systemd-units.sh" --principal "$PRINCIPAL" --issuer "$ISSUER" \
              --resource "$RESOURCE" --port "$PORT" --instance-name "$INSTANCE_NAME") ;;
     60) CMD=("$LIB/60-verify-local.sh" --port "$PORT") ;;
+    70) CMD=("$LIB/70-agent-install.sh") ;;
     *) die "unknown phase: $phase" ;;
   esac
 }
@@ -126,21 +129,17 @@ done
 cat <<EOF
 
 ==========================================================================
- Atlas instance is up. Next steps (in order):
+ Your Atlas is up. Two steps left, then you're done with the terminal:
 
- 1. Install Claude Code and log in:
-      curl -fsSL https://claude.ai/install.sh | bash
+ 1. Start your agent and log in with your own Claude account:
       claude
-    (check https://docs.claude.com if the install command has changed)
 
- 2. Reach it from outside this machine — from a Claude Code session on this
-    box, follow docs/kb/Start Here.md and RECOVERY.md. The usual shape:
-    your own Cloudflare account + a cloudflared tunnel pointing at
-    http://127.0.0.1:${PORT}, then connect Claude's web/phone/desktop
-    connectors to your public URL. Once the real URL exists:
-      ./bootstrap.sh --phase 50 --issuer https://your-real-url --principal ${PRINCIPAL}
+ 2. In that first session, type:
+      Read "Start Here.md" and introduce yourself.
 
- 3. Connector login uses the OAuth login secret printed ONCE by phase 40
-    above (rotate with recovery/reset-login-secret.sh if lost).
+ That's it. Anything else — including reaching your Atlas from your
+ phone, backups, or fixing something that breaks — you just ask the
+ agent for in plain words. It knows how, and it does the technical
+ parts itself.
 ==========================================================================
 EOF
