@@ -133,6 +133,9 @@ cat <<EOF
 
  1. Start your agent:
       claude
+    (If that says "command not found", log out and back in once — the
+    install landed in a folder your current login predates — then run
+    it again.)
     The first run walks you through logging in. Choose the "Claude
     account" option (your own subscription, not Console). This machine
     has no browser, so it prints a link — open that link on your phone
