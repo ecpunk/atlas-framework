@@ -27,6 +27,15 @@ class Rule(BaseModel):
     enforcement_point: VocabRef
     on_violation: str = Field(..., min_length=1)
 
+    # Enforcement/ratification provenance (optional; added 2026-08-08 process-gate
+    # honesty pass). enforcement_impl, when set, is a path (relative to /opt/stack
+    # unless absolute) to the script/hook/generator that MECHANICALLY enforces this
+    # rule -- something that can refuse or flag a violation, not documentation of
+    # intent and not delivery-only surfacing.
+    enforcement_impl: Optional[str] = None
+    ratified_by: Optional[str] = None
+    ratified_at: Optional[str] = None
+
     min_plan_number: Optional[int] = None
 
     authored_by: str = Field(..., min_length=1)

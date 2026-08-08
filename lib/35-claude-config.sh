@@ -97,6 +97,12 @@ if os.path.exists(settings_path):
 enabled = settings.setdefault("enabledMcpjsonServers", [])
 if "atlas" not in enabled:
     enabled.append("atlas")
+# Pre-approve every tool on the instance's own Atlas server so the owner's
+# first session isn't a wall of per-tool permission prompts. Scope is exactly
+# this one loopback server ("mcp__atlas__*"); everything else still prompts.
+allow = settings.setdefault("permissions", {}).setdefault("allow", [])
+if "mcp__atlas__*" not in allow:
+    allow.append("mcp__atlas__*")
 json.dump(settings, open(settings_path, "w"), indent=2)
 PY
 log "local Atlas MCP wired for sessions in $REPO_ROOT (.mcp.json -> 127.0.0.1:$PORT, pre-approved in .claude/settings.json)"
