@@ -4,6 +4,5 @@
 __pycache__/
 *.pyc
 .ai-bootstrap-claude-md-version
-NEXT_STEPS.txt
 .mcp.json
 .claude/

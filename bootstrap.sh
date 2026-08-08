@@ -126,49 +126,14 @@ done
 [ "$DRY_RUN" -eq 1 ] && exit 0
 [ -n "$ONLY_PHASE" ] && exit 0
 
-# Printed AND saved to a file — the agent's first-run screens clear the
-# terminal, and these instructions must survive that (learned live: the
-# owner lost them to the TUI and had nothing to work from).
-tee "$REPO_ROOT/NEXT_STEPS.txt" <<EOF
+# One source of instructions: the setup guide the owner is already
+# following on their own computer. The terminal only points back to it —
+# anything longer gets eaten the moment the agent's screens take over.
+cat <<EOF
 
 ==========================================================================
- Your Atlas is up. Two steps left, then you're done with commands:
+ Your Atlas is up.
 
- 1. Start your agent — in your SSH window, type these two lines:
-      cd /opt/stack/atlas-store
-      claude
-    Starting it in this folder matters — that's where it finds your
-    Atlas. (If claude says "command not found", close the SSH window,
-    connect again, and retry — the install landed in a folder your
-    login predates.)
-    The first run logs you in, screen by screen:
-      - It may first ask you to "Choose the text style" — just press
-        Enter.
-      - It may offer other display options (like a "flicker-free"
-        mode) — any answer is fine; these screens change with agent
-        updates, and none of them affect your setup.
-      - "Select login method" — choose 1, "Claude account with
-        subscription", and press Enter.
-      - It shows a long web link and waits for a code. Click the link
-        (hold Ctrl and click in most terminals), or copy and paste it
-        into your browser. Log in with your Claude account there.
-      - The browser hands you a code — copy it, paste it back into
-        this terminal, press Enter.
-      - A couple of confirmation screens follow (security notes, and
-        whether to trust this folder) — accept them.
-
- 2. In that first session, type:
-      Read "Start Here.md" and introduce yourself.
-
- That's it. Anything else — including reaching your Atlas from your
- phone, backups, or fixing something that breaks — you just ask the
- agent for in plain words. It knows how, and it does the technical
- parts itself.
-
- Good to know: leave the agent by typing /exit — that brings your
- normal prompt back. Close the SSH window afterwards by typing exit.
-
- This message is saved as NEXT_STEPS.txt in this folder. If the screen
- gets cleared, bring it back with:  cat NEXT_STEPS.txt
+ Continue with your setup guide — next section: "Start your agent".
 ==========================================================================
 EOF
