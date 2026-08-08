@@ -18,6 +18,7 @@ ATLAS_OAUTH_ENABLED flag (P5 cutover). Building/committing it changes nothing at
 from __future__ import annotations
 
 import json
+import logging
 import os
 import secrets
 import sqlite3
@@ -70,6 +71,78 @@ def verify_login(secret: str) -> bool:
 
 def _now() -> int:
     return int(time.time())
+
+
+# ---------------------------------------------------------------------------
+# Brute-force protection for /oauth/login
+# ---------------------------------------------------------------------------
+_LOGIN_LOG = logging.getLogger("atlas_oauth.login")
+
+
+class LoginAttemptLimiter:
+    """In-memory failed-attempt tracker for the single-operator login form.
+
+    Single-process server, so a couple of plain dicts/lists are the whole
+    mechanism — no disk state, nothing to clean up. A restart clears counters,
+    which is fine: it also drops any in-flight guessing run.
+    """
+
+    MAX_IP_FAILURES = 5
+    IP_WINDOW_SECONDS = 15 * 60
+    IP_LOCKOUT_SECONDS = 15 * 60
+    MAX_GLOBAL_FAILURES = 50
+    GLOBAL_WINDOW_SECONDS = 15 * 60
+    GLOBAL_LOCKOUT_SECONDS = 15 * 60
+
+    def __init__(self, clock=time.monotonic):
+        self._clock = clock
+        self._ip_failures: dict[str, list[float]] = {}
+        self._ip_lockout_until: dict[str, float] = {}
+        self._global_failures: list[float] = []
+        self._global_lockout_until: float = 0.0
+
+    @staticmethod
+    def _prune(timestamps: list[float], window: float, now: float) -> list[float]:
+        cutoff = now - window
+        return [t for t in timestamps if t > cutoff]
+
+    def locked(self, ip: str) -> bool:
+        """Call BEFORE evaluating the secret: a locked-out request gets the same
+        generic response whether the secret it sent happens to be right or wrong."""
+        now = self._clock()
+        return now < self._global_lockout_until or now < self._ip_lockout_until.get(ip, 0.0)
+
+    def record_failure(self, ip: str) -> None:
+        now = self._clock()
+        _LOGIN_LOG.warning("oauth login: failed attempt ip=%s", ip)
+
+        fails = self._prune(self._ip_failures.get(ip, []), self.IP_WINDOW_SECONDS, now)
+        fails.append(now)
+        self._ip_failures[ip] = fails
+        if len(fails) >= self.MAX_IP_FAILURES:
+            self._ip_lockout_until[ip] = now + self.IP_LOCKOUT_SECONDS
+            _LOGIN_LOG.warning(
+                "oauth login: ip=%s locked out for %ss (%d failures in %ds window)",
+                ip, self.IP_LOCKOUT_SECONDS, len(fails), self.IP_WINDOW_SECONDS,
+            )
+
+        glob = self._prune(self._global_failures, self.GLOBAL_WINDOW_SECONDS, now)
+        glob.append(now)
+        self._global_failures = glob
+        if len(glob) >= self.MAX_GLOBAL_FAILURES:
+            self._global_lockout_until = now + self.GLOBAL_LOCKOUT_SECONDS
+            _LOGIN_LOG.warning(
+                "oauth login: form globally locked out for %ss (%d failures across all IPs in "
+                "%ds window, last from ip=%s)",
+                self.GLOBAL_LOCKOUT_SECONDS, len(glob), self.GLOBAL_WINDOW_SECONDS, ip,
+            )
+
+    def record_success(self, ip: str) -> None:
+        self._ip_failures.pop(ip, None)
+        self._ip_lockout_until.pop(ip, None)
+
+
+login_limiter = LoginAttemptLimiter()
 
 
 # ---------------------------------------------------------------------------

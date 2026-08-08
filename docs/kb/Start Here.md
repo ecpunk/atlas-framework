@@ -113,12 +113,24 @@ you checked, what you couldn't, and what you're still assuming.
 
 ### Remote access (phone/browser)
 When asked to make Atlas reachable from a phone or browser, run
-`tools/setup-remote-access.sh --hostname <name-they-choose>.<their-domain>`
-from the repo root. It needs two things from them: a Cloudflare account with
-that domain already added, and one browser login when it runs `cloudflared
-tunnel login`. Everything else — installing cloudflared, the tunnel, DNS,
-config, the system service — is scripted, and it re-runs bootstrap.sh's
-phase 50 itself at the end, so nothing else needs doing by hand.
+`tools/setup-remote-access.sh` from the repo root and let it drive. The
+owner supplies exactly two things, and you ask for nothing else:
+
+1. A Cloudflare account with their domain in it (Cloudflare's registrar
+   can sell them one inside the same account if they have none).
+2. One API token, created from the link/template the script names, pasted
+   into the script's own hidden prompt — never into this chat.
+
+The script derives everything: hostname (`atlas.<their-domain>` — it asks
+one question only if the account holds several domains), tunnel, DNS, the
+system service, and the phase-50 re-run. When it finishes it prints the
+public URL; then walk the owner through adding that URL as a custom
+connector on their Claude surfaces, using the login secret (regenerate via
+`recovery/reset-login-secret.sh` if it's lost — never hunt scrollback).
+
+**Be decisive on plumbing.** For this and any similar infrastructure ask:
+gather the one missing fact, run the tool, report the result. Never
+present the owner a menu of architectural options — deciding is your job.
 
 ---
 

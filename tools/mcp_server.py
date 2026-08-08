@@ -3542,14 +3542,32 @@ if __name__ == "__main__":
             )
             return HTMLResponse(body, status_code=code)
 
+        def _oauth_client_ip(request: Request) -> str:
+            """CF-Connecting-IP is only trustworthy when it came through cloudflared,
+            i.e. the socket peer is loopback. A non-loopback peer can put whatever it
+            wants in that header, so from anywhere else it's ignored in favor of the
+            real peer address."""
+            peer = request.client.host if request.client else ""
+            if peer in ("127.0.0.1", "::1"):
+                cf_ip = request.headers.get("cf-connecting-ip", "").strip()
+                if cf_ip:
+                    return cf_ip
+            return peer
+
         async def oauth_login(request: Request):
+            from atlas_oauth import login_limiter as _login_limiter
             from atlas_oauth import verify_login as _verify_login
             if request.method == "GET":
                 return _login_page(request.query_params.get("ticket", ""))
             form = await request.form()
             ticket = str(form.get("ticket", ""))
+            ip = _oauth_client_ip(request)
+            if _login_limiter.locked(ip):
+                return _login_page(ticket, "Too many attempts. Try again later.", code=429)
             if not _verify_login(str(form.get("secret", ""))):
+                _login_limiter.record_failure(ip)
                 return _login_page(ticket, "Invalid login secret.", code=401)
+            _login_limiter.record_success(ip)
             redir = _atlas_oauth_provider.complete_authorization(ticket)
             if not redir:
                 return _login_page("", "Login request expired — restart from your client.", code=400)
