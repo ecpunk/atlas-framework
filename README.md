@@ -18,10 +18,16 @@ anywhere.
 
 Run these in the SSH window on your own computer (see the install guide's
 "Switch to your own computer" section) — not at the machine's own keyboard.
-Copy and paste them one at a time:
+
+First this line by itself (it asks for your password):
 
 ```
 sudo mkdir -p /opt/stack && sudo chown "$USER" /opt/stack
+```
+
+Then these three lines as one paste:
+
+```
 git clone https://github.com/ecpunk/atlas-framework.git /opt/stack/atlas-store
 cd /opt/stack/atlas-store
 ./bootstrap.sh

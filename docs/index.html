@@ -1,0 +1,640 @@
+<title>Set up your Atlas</title>
+<style>
+  :root {
+    --bg: #ffffff;
+    --fg: #1a1a1a;
+    --muted: #55595f;
+    --border: #dcdfe3;
+    --accent: #2563eb;
+    --accent-fg: #ffffff;
+    --code-bg: #f4f5f7;
+    --code-fg: #1a1a1a;
+    --card-bg: #f9fafb;
+    --card-border: #d3d7dd;
+    --warn-border: #b45309;
+    --warn-bg: #fff8ec;
+    --link: #1d4ed8;
+    --details-bg: #f4f5f7;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #14161a;
+      --fg: #e7e8ea;
+      --muted: #a5aab2;
+      --border: #33373e;
+      --accent: #7aa2f7;
+      --accent-fg: #10131a;
+      --code-bg: #1e2126;
+      --code-fg: #e7e8ea;
+      --card-bg: #1b1e24;
+      --card-border: #3a3f47;
+      --warn-border: #d99a3d;
+      --warn-bg: #2a2116;
+      --link: #8ab4ff;
+      --details-bg: #1e2126;
+    }
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.6;
+  }
+
+  .wrap {
+    max-width: 760px;
+    margin: 0 auto;
+    padding: 3rem 1.5rem 5rem;
+  }
+
+  h1 {
+    font-size: 2rem;
+    margin: 0 0 0.25rem;
+  }
+
+  h2 {
+    font-size: 1.4rem;
+    margin: 2.5rem 0 1rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid var(--border);
+  }
+
+  h2:first-of-type {
+    border-top: none;
+    padding-top: 0;
+  }
+
+  h3 {
+    font-size: 1.1rem;
+    margin: 1.75rem 0 0.75rem;
+  }
+
+  p { margin: 0.9rem 0; }
+
+  .tagline {
+    color: var(--muted);
+    margin: 0 0 1.5rem;
+  }
+
+  a { color: var(--link); }
+
+  code {
+    background: var(--code-bg);
+    color: var(--code-fg);
+    padding: 0.15em 0.4em;
+    border-radius: 4px;
+    font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 0.9em;
+  }
+
+  ol, ul {
+    padding-left: 1.4rem;
+  }
+
+  li { margin: 0.5rem 0; }
+
+  li > ul {
+    margin-top: 0.4rem;
+  }
+
+  .step-list > li {
+    margin: 0.9rem 0;
+  }
+
+  .emphasis {
+    border-left: 4px solid var(--warn-border);
+    background: var(--warn-bg);
+    padding: 0.75rem 1rem;
+    border-radius: 0 6px 6px 0;
+    margin-left: -1rem;
+  }
+
+  /* code blocks */
+  .code-block {
+    position: relative;
+    margin: 1rem 0;
+  }
+
+  .code-block pre {
+    background: var(--code-bg);
+    color: var(--code-fg);
+    padding: 1rem 5.5rem 1rem 1rem;
+    border-radius: 8px;
+    overflow-x: auto;
+    margin: 0;
+    font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 0.9rem;
+    line-height: 1.5;
+  }
+
+  .code-block pre code {
+    background: none;
+    padding: 0;
+    border-radius: 0;
+    font-size: inherit;
+  }
+
+  .copy-btn {
+    position: absolute;
+    top: 0.6rem;
+    right: 0.6rem;
+    font-size: 0.8rem;
+    padding: 0.3rem 0.6rem;
+    border-radius: 5px;
+    border: 1px solid var(--card-border);
+    background: var(--card-bg);
+    color: var(--fg);
+    cursor: pointer;
+  }
+
+  .copy-btn:hover { border-color: var(--accent); }
+
+  /* hardware picker */
+  .picker {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+    margin: 1.5rem 0 2rem;
+  }
+
+  @media (max-width: 560px) {
+    .picker { grid-template-columns: 1fr; }
+  }
+
+  .path-btn {
+    text-align: left;
+    background: var(--card-bg);
+    border: 2px solid var(--card-border);
+    border-radius: 10px;
+    padding: 1.25rem;
+    cursor: pointer;
+    color: var(--fg);
+    font-family: inherit;
+    font-size: 1rem;
+  }
+
+  .path-btn strong {
+    display: block;
+    font-size: 1.1rem;
+    margin-bottom: 0.4rem;
+  }
+
+  .path-btn .sub {
+    color: var(--muted);
+    font-size: 0.92rem;
+  }
+
+  .path-btn.active {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 1px var(--accent);
+  }
+
+  .path-section {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 0.25rem 1.5rem 1.5rem;
+    margin-bottom: 2rem;
+  }
+
+  .path-section > h2:first-child {
+    border-top: none;
+  }
+
+  /* details / troubleshooting */
+  details {
+    background: var(--details-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.6rem 1rem;
+    margin: 0.75rem 0;
+  }
+
+  details summary {
+    cursor: pointer;
+    font-weight: 600;
+  }
+
+  details p, details .code-block {
+    margin-top: 0.6rem;
+  }
+
+  footer {
+    margin-top: 3rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid var(--border);
+    color: var(--muted);
+    font-size: 0.9rem;
+  }
+</style>
+
+<div class="wrap">
+
+  <h1>Set up your Atlas</h1>
+
+  <h2>Installing Ubuntu (the OS under Atlas)</h2>
+
+  <p>Two paths, depending on the hardware. <strong>Pick one, then both end at
+  the same place</strong>: a black screen with a login prompt. After that you
+  switch to your own computer for everything else &mdash; the &ldquo;Switch to
+  your own computer&rdquo; section explains how.</p>
+
+  <div class="picker">
+    <button type="button" class="path-btn" id="btn-a" data-path="a" aria-pressed="false">
+      <strong>A regular PC</strong>
+      <span class="sub">Desktop or laptop, Intel or AMD: make an installer USB stick, boot from it, answer about ten screens.</span>
+    </button>
+    <button type="button" class="path-btn" id="btn-b" data-path="b" aria-pressed="false">
+      <strong>A Raspberry Pi</strong>
+      <span class="sub">No installer at all. You write a ready-made Ubuntu straight onto the Pi&rsquo;s SD card (or USB drive) from another computer, and the Pi just boots into it. The regular-PC installer stick will NOT boot on a Pi &mdash; different kind of processor.</span>
+    </button>
+  </div>
+
+  <!-- ================= PATH A ================= -->
+  <section class="path-section" id="path-a" hidden>
+    <h2>Path A &mdash; regular PC</h2>
+
+    <p><strong>You need:</strong> the PC itself, an empty USB stick (8GB or
+    bigger &mdash; it gets erased), another working computer, and an ethernet
+    cable to your router.</p>
+
+    <h3>1. Make the install USB (on any working computer)</h3>
+    <ol>
+      <li>Download <strong>Ubuntu Server 24.04 LTS</strong>. Direct link (starts the
+      download immediately):
+      <a href="https://ubuntu.com/download/server/thank-you?version=24.04.4&amp;architecture=amd64&amp;lts=true">ubuntu.com/download/server/thank-you?version=24.04.4&amp;architecture=amd64&amp;lts=true</a>.
+      If that link has gone stale (version numbers move on), just go to
+      <a href="https://ubuntu.com/download/server">ubuntu.com/download/server</a> and take the LTS one.</li>
+      <li>Download <strong>balenaEtcher</strong> from
+      <a href="https://etcher.balena.io">etcher.balena.io</a> and open it.</li>
+      <li>In Etcher: pick the Ubuntu file you downloaded &rarr; pick the USB stick &rarr;
+      <strong>Flash</strong>. Everything on the stick is erased.</li>
+    </ol>
+
+    <h3>2. Boot the PC from the USB</h3>
+    <ol>
+      <li>Plug in the ethernet cable and the USB stick. Power the PC on and
+      immediately tap the boot-menu key over and over &mdash; usually
+      <code>F12</code> (sometimes F11, F8, or Esc; the very first splash
+      screen names it, e.g. &ldquo;F12 = Boot Menu&rdquo;).</li>
+      <li>Pick the USB stick from the menu.</li>
+      <li>At the purple menu, choose <strong>&ldquo;Try or Install Ubuntu
+      Server&rdquo;</strong>.</li>
+    </ol>
+
+    <h3>3. The installer screens, in the order they appear</h3>
+    <p>Arrow keys move, Enter selects, Tab gets you to &ldquo;Done&rdquo;.</p>
+    <ol class="step-list">
+      <li><strong>Language</strong> &mdash; English.</li>
+      <li><strong>Keyboard</strong> &mdash; leave defaults &rarr; Done.</li>
+      <li><strong>Type of install</strong> &mdash; keep <strong>&ldquo;Ubuntu
+      Server&rdquo;</strong> (do NOT pick &ldquo;minimized&rdquo;) &rarr; Done.</li>
+      <li>
+        <strong>Network</strong> &mdash; wait until the wired connection shows
+        an address like <code>192.168.x.x</code>, then Done.
+        <details>
+          <summary>If no address ever appears, stop</summary>
+          <p>Reseat the ethernet cable or try another port on the router. Do
+          not continue without an address; the install would finish but the
+          machine would be offline. (A previous install hit exactly this
+          &mdash; a network port that quietly refused to connect.)</p>
+        </details>
+      </li>
+      <li><strong>&ldquo;Installer update available&rdquo;</strong> &mdash; if
+      this screen appears, choose <strong>&ldquo;Update to the new
+      installer&rdquo;</strong> and let it download. It shows up whenever
+      Canonical has shipped installer fixes since the disc image was made,
+      which is most of the time &mdash; it does not mean your download was
+      old.</li>
+      <li><strong>Proxy</strong> &mdash; leave empty &rarr; Done.</li>
+      <li><strong>Mirror</strong> &mdash; leave as-is, let its test finish
+      &rarr; Done.</li>
+      <li class="emphasis"><strong>Storage &mdash; the one screen where the
+      default is wrong.</strong> Keep &ldquo;Use an entire disk&rdquo;, but
+      <strong>UNCHECK &ldquo;Set up this disk as an LVM group&rdquo;</strong>
+      &rarr; Done &rarr; Done again &rarr; <strong>Continue</strong> on the
+      red warning. (The warning means the PC&rsquo;s disk gets erased &mdash;
+      that&rsquo;s intended.) Why uncheck: the LVM default silently uses only
+      ~100GB of the disk and hides the rest; a previous install left 800GB of
+      a 900GB drive invisible this way.</li>
+      <li><strong>Profile</strong> &mdash; your name; <strong>the
+      server&rsquo;s name: one short lowercase word</strong> (this becomes
+      your Atlas instance&rsquo;s name &mdash; e.g. <code>atlas</code>); a
+      username; a password you will remember. &rarr; Done.</li>
+      <li><strong>Ubuntu Pro</strong> &mdash; &ldquo;Skip for now&rdquo;
+      &rarr; Continue.</li>
+      <li class="emphasis"><strong>SSH &mdash; the second screen you cannot
+      get wrong.</strong> Move the highlight to <strong>&ldquo;Install
+      OpenSSH server&rdquo;</strong> and press <strong>Space or Enter so an X
+      appears in the box</strong> &mdash; then Done. Without that X, your own
+      computer cannot connect later and you&rsquo;ll be stuck at the
+      machine&rsquo;s keyboard. (It only allows computers inside your own
+      house to log in &mdash; nothing outside can reach it.)</li>
+      <li><strong>Featured server snaps</strong> &mdash; select
+      <strong>nothing</strong> &rarr; Done.</li>
+    </ol>
+
+    <h3>4. Wait, then reboot</h3>
+    <ol>
+      <li>The install runs (progress scrolls by). Wait for <strong>&ldquo;Install
+      complete!&rdquo;</strong>, then choose <strong>&ldquo;Reboot Now&rdquo;</strong>.</li>
+      <li>When it asks, pull the USB stick out and press Enter.</li>
+      <li>The machine boots to a black screen ending in a login prompt.
+      <strong>That is correct &mdash; there is no desktop on purpose.</strong>
+      Log in with the username and password from step 3.9.</li>
+    </ol>
+  </section>
+
+  <!-- ================= PATH B ================= -->
+  <section class="path-section" id="path-b" hidden>
+    <h2>Path B &mdash; Raspberry Pi</h2>
+
+    <p><strong>You need:</strong> the Pi (a Pi 4 or newer with at least 2GB of
+    memory), its SD card &mdash; or better, a USB-attached SSD &mdash; 16GB or
+    bigger (it gets erased), another working computer, and an ethernet cable
+    to your router.</p>
+
+    <h3>1. Write Ubuntu onto the card (on any working computer)</h3>
+    <ol>
+      <li>Download <strong>Raspberry Pi Imager</strong> from
+      <a href="https://raspberrypi.com/software">raspberrypi.com/software</a>,
+      install it, open it. (It&rsquo;s the Pi makers&rsquo; official flashing
+      app: it downloads the right Ubuntu for the Pi itself and lets you
+      preset your username and the machine&rsquo;s name before writing.)</li>
+      <li><strong>CHOOSE DEVICE</strong> &rarr; your Pi model (e.g. Raspberry
+      Pi 4).</li>
+      <li><strong>CHOOSE OS</strong> &rarr; <em>Other general-purpose OS
+      &rarr; Ubuntu &rarr; Ubuntu Server 24.04 LTS (64-bit)</em>.</li>
+      <li><strong>CHOOSE STORAGE</strong> &rarr; the SD card / USB drive.
+      Everything on it is erased.</li>
+      <li>Click <strong>NEXT</strong> &rarr; it asks about <strong>OS
+      customisation</strong> &rarr; <strong>EDIT SETTINGS</strong>:
+        <ul>
+          <li>hostname: <strong>one short lowercase word</strong> (this
+          becomes your Atlas instance&rsquo;s name &mdash; e.g.
+          <code>atlas</code>)</li>
+          <li>a username and a password you will remember</li>
+          <li>on the <strong>Services</strong> tab: <strong>enable
+          SSH</strong>, &ldquo;use password authentication&rdquo;</li>
+        </ul>
+        Save, then <strong>YES</strong> twice &mdash; it downloads and writes.
+      </li>
+    </ol>
+
+    <h3>2. Boot the Pi</h3>
+    <ol>
+      <li>Put the card/drive in the Pi, plug in ethernet, then power. First
+      boot takes a couple of minutes (it resizes itself; the screen may sit
+      quiet &mdash; give it five minutes before worrying).</li>
+      <li>It ends at a black screen with a login prompt. <strong>That is
+      correct &mdash; there is no desktop on purpose.</strong> Log in with the
+      username and password you set in Imager.</li>
+    </ol>
+  </section>
+
+  <!-- ================= SHARED: SWITCH ================= -->
+  <h2>Switch to your own computer (both paths)</h2>
+
+  <p>The machine&rsquo;s own screen and keyboard were only needed to get the
+  OS on. From here you work from your normal computer instead &mdash; a real
+  window where you can copy, paste, and click links. Two things to collect
+  first, at the machine:</p>
+
+  <ol>
+    <li><strong>Its address.</strong> Right after you log in, the welcome
+    text includes a line like <code>IPv4 address for eno1: 192.168.1.x</code>
+    &mdash; write down that <code>192.168.x.x</code> number. (If it has
+    scrolled away, type <code>hostname -I</code> and press Enter; the first
+    number it prints is the one you want.)</li>
+    <li><strong>Your username and password</strong> &mdash; the ones you
+    created during the install. Same login from anywhere in the house.</li>
+  </ol>
+
+  <p>Now, on your own computer, open the built-in terminal:</p>
+  <ul>
+    <li><strong>Windows</strong>: press the Windows key, type
+    <code>powershell</code>, press Enter.</li>
+    <li><strong>Mac</strong>: press Cmd+Space, type <code>terminal</code>,
+    press Enter.</li>
+  </ul>
+
+  <p>In that window, type (your username, the @ sign, then the address):</p>
+
+  <div class="code-block">
+    <button type="button" class="copy-btn">Copy</button>
+    <pre><code>ssh yourusername@192.168.x.x</code></pre>
+  </div>
+
+  <p>The first time, it asks whether to trust this machine &mdash; type
+  <code>yes</code> and press Enter.</p>
+
+  <details>
+    <summary>If you get a big &ldquo;WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED&rdquo; block</summary>
+    <p>That happens when the machine&rsquo;s OS has been reinstalled &mdash;
+    your computer remembers the old install. Not an attack in a home setting.
+    Type this, then try the ssh line again:</p>
+    <div class="code-block">
+      <button type="button" class="copy-btn">Copy</button>
+      <pre><code>ssh-keygen -R 192.168.x.x</code></pre>
+    </div>
+    <p>(using the machine&rsquo;s actual address).</p>
+  </details>
+
+  <details>
+    <summary>If it says &ldquo;Connection refused&rdquo;</summary>
+    <p>The OpenSSH box didn&rsquo;t get ticked during the install. Fix it at
+    the machine&rsquo;s keyboard &mdash; log in there and type this one line,
+    then come back to your own computer and try again:</p>
+    <div class="code-block">
+      <button type="button" class="copy-btn">Copy</button>
+      <pre><code>sudo apt install -y openssh-server &amp;&amp; sudo systemctl enable --now ssh</code></pre>
+    </div>
+    <p>(That line fixes it whether the install step was skipped or the
+    service just didn&rsquo;t start.) Then it asks for your password (typing
+    shows nothing on screen &mdash; that&rsquo;s normal). You end up at the
+    same prompt you saw on the machine&rsquo;s own screen &mdash; you&rsquo;re
+    now driving it from your computer.</p>
+  </details>
+
+  <p><strong>Every step from here on happens in this window,</strong> not at
+  the machine. You can walk away from the machine itself; it just needs power
+  and ethernet.</p>
+
+  <!-- ================= SHARED: INSTALL ================= -->
+  <h2>Install Atlas (both paths)</h2>
+
+  <p>Two paste-chunks in the SSH window (right-click usually pastes in
+  PowerShell).</p>
+
+  <p>First this line by itself &mdash; it asks for your password (your login
+  password again; typing shows nothing):</p>
+
+  <div class="code-block">
+    <button type="button" class="copy-btn">Copy</button>
+    <pre><code>sudo mkdir -p /opt/stack &amp;&amp; sudo chown "$USER" /opt/stack</code></pre>
+  </div>
+
+  <p>Then these three lines as one paste:</p>
+
+  <div class="code-block">
+    <button type="button" class="copy-btn">Copy</button>
+    <pre><code>git clone https://github.com/ecpunk/atlas-framework.git /opt/stack/atlas-store
+cd /opt/stack/atlas-store
+./bootstrap.sh</code></pre>
+  </div>
+
+  <p>Notes while it runs:</p>
+  <ul>
+    <li>It asks for your password once or twice
+    (<code>[sudo] password for ...</code>) &mdash; that&rsquo;s your login
+    password again.</li>
+    <li>It prints a <strong>login secret</strong> in a boxed message, shown
+    only once &mdash; copy it somewhere safe. You&rsquo;ll need it later if
+    you connect your phone; if it&rsquo;s ever lost, it can be regenerated,
+    so don&rsquo;t panic either way.</li>
+    <li>Right after a fresh install the system updates itself in the
+    background. If the setup runs into that, it says so and waits (up to
+    half an hour) instead of failing &mdash; let it sit.</li>
+    <li>It ends with a boxed &ldquo;Your Atlas is up&rdquo; message pointing
+    you to the next section here.</li>
+  </ul>
+
+  <!-- ================= SHARED: START ================= -->
+  <h2>Start your agent (both paths)</h2>
+
+  <p>Still in the SSH window, type these two lines:</p>
+
+  <div class="code-block">
+    <button type="button" class="copy-btn">Copy</button>
+    <pre><code>cd /opt/stack/atlas-store
+claude</code></pre>
+  </div>
+
+  <p>Starting it in that folder matters &mdash; it&rsquo;s where the agent
+  finds your Atlas.</p>
+
+  <details>
+    <summary>If <code>claude</code> says &ldquo;command not found&rdquo;</summary>
+    <p>Close the SSH window, connect again, and retry &mdash; the install
+    landed in a folder your login predates.</p>
+  </details>
+
+  <p>The first run sets itself up and logs you in, screen by screen:</p>
+  <ol>
+    <li>It may ask you to <strong>&ldquo;Choose the text style&rdquo;</strong>
+    &mdash; just press Enter.</li>
+    <li>It may offer other display options (a &ldquo;flicker-free&rdquo;
+    mode, and similar) &mdash; any answer is fine; these screens change with
+    agent updates and none of them affect your setup.</li>
+    <li><strong>&ldquo;Select login method&rdquo;</strong> &mdash; choose 1,
+    <strong>&ldquo;Claude account with subscription&rdquo;</strong>, and press
+    Enter.</li>
+    <li>It shows a <strong>long web link</strong> and waits for a code. Click
+    the link (hold Ctrl and click in most terminals), or copy and paste it
+    into your browser. Log in with your Claude account there.</li>
+    <li>The browser hands you a <strong>code</strong> &mdash; copy it, paste
+    it back into the terminal, press Enter.</li>
+    <li>A couple of confirmation screens follow (security notes, and whether
+    to trust this folder) &mdash; accept them.</li>
+  </ol>
+
+  <p>Then, in that first session, type:</p>
+
+  <div class="code-block">
+    <button type="button" class="copy-btn">Copy</button>
+    <pre><code>Read "Start Here.md" and introduce yourself.</code></pre>
+  </div>
+
+  <p>That&rsquo;s it. Anything else &mdash; reaching your Atlas from your
+  phone, backups, fixing something that breaks &mdash; you just ask the agent
+  for in plain words. It knows how, and it does the technical parts itself.</p>
+
+  <p>Good to know: leave the agent by typing <code>/exit</code> &mdash; that
+  brings your normal prompt back. Close the SSH window afterwards by typing
+  <code>exit</code>.</p>
+
+  <footer>Atlas &mdash; <a href="https://github.com/ecpunk/atlas-framework">github.com/ecpunk/atlas-framework</a></footer>
+
+</div>
+
+<script>
+(function () {
+  var pathButtons = document.querySelectorAll('.path-btn');
+  var pathSections = document.querySelectorAll('.path-section');
+
+  pathButtons.forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var target = btn.getAttribute('data-path');
+      var wasActive = btn.classList.contains('active');
+
+      pathButtons.forEach(function (b) {
+        b.classList.remove('active');
+        b.setAttribute('aria-pressed', 'false');
+      });
+      pathSections.forEach(function (s) {
+        s.hidden = true;
+      });
+
+      if (!wasActive) {
+        btn.classList.add('active');
+        btn.setAttribute('aria-pressed', 'true');
+        var section = document.getElementById('path-' + target);
+        if (section) {
+          section.hidden = false;
+        }
+      }
+    });
+  });
+
+  function fallbackCopy(text) {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.top = '0';
+    ta.style.left = '0';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    try {
+      document.execCommand('copy');
+    } catch (err) {
+      /* nothing more we can do */
+    }
+    document.body.removeChild(ta);
+  }
+
+  document.querySelectorAll('.copy-btn').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var block = btn.closest('.code-block');
+      var codeEl = block.querySelector('pre code') || block.querySelector('pre');
+      var text = codeEl.textContent;
+
+      var showCopied = function () {
+        var original = btn.textContent;
+        btn.textContent = 'Copied';
+        btn.disabled = true;
+        setTimeout(function () {
+          btn.textContent = original;
+          btn.disabled = false;
+        }, 1500);
+      };
+
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(showCopied, function () {
+          fallbackCopy(text);
+          showCopied();
+        });
+      } else {
+        fallbackCopy(text);
+        showCopied();
+      }
+    });
+  });
+})();
+</script>
