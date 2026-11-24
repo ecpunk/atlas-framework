@@ -14,6 +14,9 @@ thing up as a systemd service on an Ubuntu machine. Your data stays yours:
 everything you record is committed to YOUR local clone and never pushed
 anywhere.
 
+For what Atlas does in day-to-day use and what each part gets you, see
+[How we run Atlas](docs/how-we-run-atlas.md).
+
 ## Quick start (fresh Ubuntu box)
 
 Run these in the SSH window on your own computer (see the install guide's
