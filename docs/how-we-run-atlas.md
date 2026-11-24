@@ -12,6 +12,19 @@ Structured records kept in git: projects, tasks, rules, the things we operate, a
 
 Next to the records is a knowledge base of markdown documents, one folder per project. Every document carries frontmatter in Google's [Open Knowledge Format](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md) (OKF), which says what kind of document it is, who wrote it, when, and where its claims came from. We use OKF's fields and keep our own folder layout and indexes. Agents write the documents, and the summary pages are generated from the records.
 
+```mermaid
+flowchart TD
+    P["People"] --> S
+    A["AI agents"] --> S
+    J["Automations"] --> S
+    S["MCP server<br/>one profile per caller"]
+    S -->|"preview, then confirm"| R[("Records<br/>YAML in git, schema-validated")]
+    S --> W["Document write path<br/>stamps the author, rejects bad writes"]
+    W --> K[("Knowledge base<br/>markdown with OKF frontmatter")]
+    R --> G["Generators, on a schedule"]
+    G -->|"indexes, status pages, rollups"| K
+```
+
 ## Everyone works from the same facts
 
 Each fact has one home. A person at a terminal, a chat session on a phone and an unattended job all query the same record and get the same answer. Each record of something we run also states what condition it is supposed to be in, and changing that takes a written reason. Something that was paused deliberately is never reported as broken, because the record says it was paused and why.
@@ -37,6 +50,19 @@ Scheduled probes compare the records with what is actually true and report any d
 Every capability we've built is listed in a ledger with evidence of use. Each one is marked live, idle, dead or unknown, and unknown means nobody has measured it. It exists because we kept building things and then forgetting we had them.
 
 Agents also get checked. Before a reply is shown, a Claude Code Stop hook looks for claims that something is broken. If the session made that claim without a recent lookup, the reply goes back once with current facts attached. We added this after agents reported failures that weren't happening.
+
+```mermaid
+flowchart LR
+    T(["The real thing"]) --> P
+    R[("Records")] --> P
+    P["Scheduled probes<br/>results expire after 30 minutes"] --> D["Drift report"]
+    R --> C
+    K[("Knowledge base")] --> C
+    C["Contradiction checker<br/>no LLM"] --> F["Findings to review"]
+    A["Agent reply"] --> H{"Claims a problem<br/>without a recent lookup?"}
+    H -->|"yes"| B["Sent back once<br/>with current facts"]
+    H -->|"no"| U["Shown to the person"]
+```
 
 ## Decisions stay in the words of whoever made them
 
