@@ -53,7 +53,8 @@ mcp_body_file="$(mktemp)"
 code=""
 payload=""
 for _ in 1 2 3 4 5 6 7 8 9 10; do
-  code="$(curl -s -o "$mcp_body_file" -w '%{http_code}' "http://127.0.0.1:${PORT}/mcp" || true)"
+  tok="$(cat "$REPO_ROOT/.secrets/local_agent_token.txt" 2>/dev/null || true)"
+  code="$(curl -s -o "$mcp_body_file" -w '%{http_code}' -H "Authorization: Bearer $tok" "http://127.0.0.1:${PORT}/mcp" || true)"
   payload="$(cat "$mcp_body_file")"
   [ "$code" = "406" ] && break
   sleep 2

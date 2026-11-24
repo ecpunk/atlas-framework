@@ -64,8 +64,9 @@ install_it() {
 }
 
 # ---- Local MCP wiring: sessions started in this folder get the instance's
-# own Atlas automatically (project-scope .mcp.json; loopback needs no auth —
-# the server injects a local token for 127.0.0.1 callers). Merge-not-clobber:
+# own Atlas automatically (project-scope .mcp.json; the session sends the
+# local-agent bearer through tools/atlas_mcp_headers.sh, since loopback alone
+# is not trusted). Merge-not-clobber:
 # other entries the owner/agent adds later are preserved.
 PORT="$PORT" python3 - "$REPO_ROOT" <<'PY'
 import json, os, sys
@@ -82,6 +83,7 @@ if os.path.exists(mcp_path):
 cfg.setdefault("mcpServers", {})["atlas"] = {
     "type": "http",
     "url": f"http://127.0.0.1:{port}/mcp",
+    "headersHelper": os.path.join(root, "tools", "atlas_mcp_headers.sh"),
 }
 json.dump(cfg, open(mcp_path, "w"), indent=2)
 
