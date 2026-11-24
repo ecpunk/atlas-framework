@@ -1,6 +1,6 @@
 # How we run Atlas
 
-> This describes Atlas as we run it in production. The code in this repository is a modular version built for others to install, and it is still being assembled. It does not yet include everything described here.
+> This describes Atlas as we run it in production. The code in this repository covers the core of it, but not yet the scheduled probes, generated index pages, session resume, contradiction and decision checks, reply-check hook, capability ledger, semantic index or curation report.
 
 Atlas is a shared source of truth for people and AI agents who work on the same things over months. Every agent session, in any tool, reads and writes it through one MCP server. It knows who is asking, records who changed what, checks its own facts against the real world, and does most of its own upkeep.
 

@@ -1,3 +1,8 @@
 pydantic==2.12.5
 pyyaml>=6.0,<7.0
 mcp[cli]>=1.27,<2
+starlette>=1.0.1  # CVE-2026-48710 (CISA KEV), 2026-11-16
+python-a2s>=1.4.2,<2  # A2S (Source/GoldSrc query protocol) functional probe for
+                       # UDP-only game servers in probe_runner.py (UDP_A2S_SERVICES);
+                       # a plain TCP connect() always false-positives "closed" on
+                       # UDP (no ECONNREFUSED without ICMP) — see UDP_A2S_SERVICES.

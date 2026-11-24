@@ -11,8 +11,14 @@ Cloning this repo gives you a complete, independent instance: the engine
 (`tools/`, `schemas/`, `vocabularies/`), an empty entity store, a small seed
 set of agent-behavior rules, and a bootstrap script that stands the whole
 thing up as a systemd service on an Ubuntu machine. Your data stays yours:
-everything you record is committed to YOUR local clone and never pushed
-anywhere.
+everything you record is committed to YOUR local clone, and Atlas never
+pushes it anywhere.
+
+Every write to the knowledge base goes through the server, which stamps the
+doc's frontmatter with who wrote it and when (`generated: {by, at}`, from
+the [Open Knowledge Format](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)).
+A write must name the agent or process making it; a person is never
+recorded as the author, and empty or placeholder content is refused.
 
 For what Atlas does in day-to-day use and what each part gets you, see
 [How we run Atlas](docs/how-we-run-atlas.md).
@@ -46,12 +52,41 @@ re-run it after any failure and it picks up where it stopped. `./bootstrap.sh
 --help` lists the options. When it finishes, it prints the next steps
 (installing Claude Code, connecting from your phone/browser).
 
+## Local install (Windows, macOS or Linux — no server)
+
+For one person on their own computer, Atlas can run as a local MCP server
+that Claude Code starts by itself: no network port, no login secret, no
+system service. You need Python 3.10+, git, and Claude Code.
+
+```
+git clone https://github.com/ecpunk/atlas-framework.git atlas
+cd atlas
+python install_local.py
+```
+
+(On macOS/Linux the command may be `python3`.) The installer builds a private
+`.venv/` inside the clone, seeds the starter rules, runs a self-test, and
+registers the server with Claude Code for your user. Start a new Claude Code
+session and Atlas is available in every project.
+
+Your records stay in the clone: every entity and KB doc is committed to the
+clone's own git history, and the installer disables `git push` for the clone
+so that history cannot be sent anywhere. `git pull` still brings engine
+updates. Run `python install_local.py --help` for the options (for example
+`--exclude ""` to keep every tool).
+
 ## Layout
 
-- `bootstrap.sh` + `lib/` — the provisioning phases (each runnable standalone).
+- `bootstrap.sh` + `lib/` — the server install: provisioning phases (each
+  runnable standalone).
+- `install_local.py` — the local install for Windows, macOS or Linux (stdio,
+  no service).
 - `tools/` — the MCP server (`mcp_server.py`) and its supporting modules
   (entity store loader, reference/link checker, file-lock helper, OAuth
-  provider, validator, session-retention sweep, service health prober).
+  provider, KB frontmatter stamper, validator, session-retention sweep,
+  service health prober), plus `local_server.py` (the stdio entry point
+  `install_local.py` registers) and `setup-remote-access.sh` (the
+  follow-on step for reaching a server install from outside).
 - `schemas/` — pydantic models, one per entity type. These define what a
   valid entity looks like and are the enforcement layer behind every write.
 - `vocabularies/` — controlled value lists (statuses, severities, lifecycle
@@ -63,11 +98,16 @@ re-run it after any failure and it picks up where it stopped. `./bootstrap.sh
   standing preferences — agents append to it as you state them).
 - `seed/rules/` — the curated starter rules `bootstrap.sh` copies into
   `entities/rules/` exactly once.
+- `mcp-instructions.md` — routing notes appended to the instructions the
+  server gives connecting agents.
 - `fixtures/claude/CLAUDE.md` — installed to `~/.claude/CLAUDE.md` by
   bootstrap so Claude Code sessions on this machine orient from the store.
 - `systemd/` — unit templates rendered and installed by bootstrap.
 - `recovery/` — plain-language recovery steps + the login-secret reset script.
+- `docs/index.html` — the step-by-step setup guide (served by GitHub Pages);
+  `docs/how-we-run-atlas.md` — how the full deployment runs.
 - `VERSION` — which upstream engine build this came from, and when.
+- `LICENSE` — MIT.
 
 ## Running it by hand
 
@@ -104,3 +144,7 @@ commit`.
 This repo is assembled from a portable subset of a larger private Atlas
 deployment's engine code. Entity data is never included — the store starts
 empty on every instance. See `VERSION` for the exact source build.
+
+## License
+
+MIT. See `LICENSE`.

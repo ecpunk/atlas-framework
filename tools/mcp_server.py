@@ -7,6 +7,7 @@ Transport: streamable-http at /mcp
 """
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import fcntl
 import hashlib
@@ -17,6 +18,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -28,10 +30,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 from pydantic import BaseModel
 
+from tools import kb_frontmatter as kbfm
 from tools.atlas_lock import atlas_write_lock
+from tools.probe_runner import health_endpoint_problem
 from tools.refs import build_ref_index, check_refs
 from tools.store import Store, load_store, _schema_for_entity_dir
 
@@ -39,20 +43,60 @@ DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8105
 DEFAULT_MCP_PATH = "/mcp"
 DEFAULT_API_KEY_FILE = REPO_ROOT / ".secrets" / "api_key.txt"
+PROBE_FILE_MAX_AGE_SECONDS = 30 * 60
 
 _store: Store | None = None
+_store_mark: tuple[int, int] | None = None
+_store_checked: float = 0.0
+STORE_RECHECK_SECONDS = 2.0
+
+
+def _store_fingerprint() -> tuple[int, int]:
+    """(file count, newest change) over entities/ and vocabularies/."""
+    count, newest = 0, 0
+    for top in ("entities", "vocabularies"):
+        stack = [REPO_ROOT / top]
+        while stack:
+            try:
+                entries = list(os.scandir(stack.pop()))
+            except OSError:
+                continue
+            for entry in entries:
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append(Path(entry.path))
+                    elif entry.name.endswith((".yaml", ".yml")):
+                        count += 1
+                        newest = max(newest, entry.stat().st_mtime_ns)
+                except OSError:
+                    continue
+    return count, newest
 
 
 def _get_store() -> Store:
-    global _store
-    if _store is None:
+    """The loaded store, reloaded when a record file changed on disk.
+
+    It used to be loaded once and kept for the life of the process, so a record
+    edited by anything other than this server's own write tools (a git pull, a
+    hand edit, another writer) was invisible here until a restart. The check
+    costs one directory walk and runs at most every STORE_RECHECK_SECONDS.
+    """
+    global _store, _store_mark, _store_checked
+    now = time.monotonic()
+    if _store is not None and now - _store_checked < STORE_RECHECK_SECONDS:
+        return _store
+    mark = _store_fingerprint()
+    _store_checked = now
+    if _store is None or mark != _store_mark:
         _store = load_store(REPO_ROOT)
+        _store_mark = mark
     return _store
 
 
 def _invalidate_store() -> None:
-    global _store
+    global _store, _store_checked
     _store = None
+    _store_checked = 0.0
 
 
 def _now_iso() -> str:
@@ -132,6 +176,52 @@ def _resolve_project_id(project: str) -> str:
     return matches[0]
 
 
+# add_task near-duplicate detection — see atlas-duplicate-task-pair-file-20260908054953.
+# A WARNING only: legitimately similar titles exist across the store (e.g. recurring
+# per-service audit tasks), so this never blocks a write, it only names a candidate.
+_DUPLICATE_TITLE_WINDOW_MINUTES = 10
+_TITLE_PUNCT_RE = re.compile(r"[^\w\s]", re.UNICODE)
+
+
+def _normalize_task_title(title: str) -> str:
+    """Case/whitespace/punctuation-insensitive key for near-duplicate matching."""
+    collapsed = re.sub(r"\s+", " ", (title or "").strip().lower())
+    return re.sub(r"\s+", " ", _TITLE_PUNCT_RE.sub("", collapsed)).strip()
+
+
+def _find_near_duplicate_task(
+    project_id: str, title: str, now: datetime, window_minutes: int = _DUPLICATE_TITLE_WINDOW_MINUTES
+) -> dict[str, Any] | None:
+    """Most recent task in project_id whose normalized title matches `title`,
+    created within window_minutes of `now`. None if no such candidate exists.
+
+    Matches against every task regardless of status — a duplicate filed against
+    an already-resolved task is still evidence of a re-file, and is exactly the
+    2026-09-08 pattern (both copies open) this guard exists to catch early.
+    """
+    needle = _normalize_task_title(title)
+    if not needle:
+        return None
+    best: dict[str, Any] | None = None
+    best_created: datetime | None = None
+    for task in _get_store().get("task", {}).values():
+        payload = _model_to_dict(task)
+        if payload.get("project_id") != project_id:
+            continue
+        if _normalize_task_title(str(payload.get("title", ""))) != needle:
+            continue
+        created = _parse_iso_or_none(payload.get("created_at"))
+        if created is None:
+            continue
+        if abs((now - created).total_seconds()) > window_minutes * 60:
+            continue
+        if best_created is None or created > best_created:
+            best, best_created = payload, created
+    if best is None:
+        return None
+    return {"id": best.get("id"), "title": best.get("title"), "created_at": best.get("created_at")}
+
+
 def _next_task_id(project_id: str, title: str, source: str, source_request_id: str) -> str:
     tasks = _get_store().get("task", {})
     if source_request_id:
@@ -149,27 +239,6 @@ def _next_task_id(project_id: str, title: str, source: str, source_request_id: s
 
     nonce = 2
     while f"{candidate}-{nonce}" in tasks:
-        nonce += 1
-    return f"{candidate}-{nonce}"
-
-
-def _next_session_id(source: str, source_request_id: str) -> str:
-    sessions = _get_store().get("session", {})
-    if source_request_id:
-        stable_seed = f"{source}|{source_request_id}"
-        stable_suffix = hashlib.sha1(stable_seed.encode("utf-8")).hexdigest()[:10]
-        candidate = f"session-{stable_suffix}"
-        if candidate not in sessions:
-            return candidate
-
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-    random_suffix = hashlib.sha1(os.urandom(16)).hexdigest()[:8]
-    candidate = f"session-{stamp}-{random_suffix}"
-    if candidate not in sessions:
-        return candidate
-
-    nonce = 2
-    while f"{candidate}-{nonce}" in sessions:
         nonce += 1
     return f"{candidate}-{nonce}"
 
@@ -205,7 +274,9 @@ def _git_commit(rel_path: str | list[str], message: str) -> dict[str, Any]:
         )
         if commit.returncode != 0:
             return {"error": f"git commit failed: {commit.stderr.strip() or commit.stdout.strip()}"}
-        return {"ok": True, "sha": commit.stdout.strip().split()[-1] if commit.stdout.strip() else ""}
+        head = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=str(REPO_ROOT),
+                              capture_output=True, text=True, timeout=10)
+        return {"ok": True, "sha": head.stdout.strip() if head.returncode == 0 else ""}
 
 
 @dataclass
@@ -314,11 +385,90 @@ def _api_key() -> str:
     return ""
 
 
-def _check_auth(provided_key: str) -> bool:
-    expected = _api_key()
-    if not expected:
-        return True  # no key configured — open (local-only use)
-    return provided_key == expected
+# Header names (already lowercase — the ASGI spec guarantees it) that mark a
+# request as having arrived through a proxy carrying client-identity data.
+_PROXY_ORIGIN_HEADERS = (b"cf-connecting-ip", b"x-forwarded-for")
+
+
+def _direct_loopback(scope) -> bool:
+    """True only for a request from 127.0.0.1/::1 that carries no proxy fingerprint
+    (cf-connecting-ip / x-forwarded-for). The same rule _LocalBearerInjector uses;
+    shared so every local-only surface applies it the same way."""
+    client = scope.get("client") or ("", 0)
+    headers = scope.get("headers", [])
+    arrived_via_proxy = any(k.lower() in _PROXY_ORIGIN_HEADERS for k, _ in headers)
+    return client[0] in ("127.0.0.1", "::1") and not arrived_via_proxy
+
+
+class _LoopbackNoOAuthHints:
+    """ASGI middleware: a direct loopback
+    caller is a local agent, which authenticates with the local-agent bearer, never with
+    OAuth. Without this, a local Claude Code session could get a 401 whose
+    WWW-Authenticate pointed at the public resource metadata, fetched it through the
+    tunnel, wrote OAuth discovery state into the shared ~/.claude/.credentials.json and
+    then failed on the resource-URL mismatch. For direct loopback only: discovery and
+    registration paths answer 404, and 401s carry no WWW-Authenticate. Requests through
+    the tunnel (proxy headers present) keep the full OAuth flow for remote clients."""
+
+    _OAUTH_PATHS = ("/.well-known/oauth-protected-resource", "/.well-known/oauth-authorization-server",
+                    "/.well-known/openid-configuration", "/register", "/authorize", "/token")
+
+    def __init__(self, asgi_app):
+        self.app = asgi_app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http" or not _direct_loopback(scope):
+            return await self.app(scope, receive, send)
+        path = scope.get("path", "")
+        if path.startswith(self._OAUTH_PATHS):
+            body = b'{"error":"not found"}'
+            await send({"type": "http.response.start", "status": 404,
+                        "headers": [(b"content-type", b"application/json"),
+                                    (b"content-length", str(len(body)).encode())]})
+            await send({"type": "http.response.body", "body": body})
+            return
+
+        async def send_without_oauth_hint(message):
+            if message.get("type") == "http.response.start" and message.get("status") == 401:
+                message = dict(message)
+                message["headers"] = [(k, v) for k, v in message.get("headers", [])
+                                      if k.lower() != b"www-authenticate"]
+            await send(message)
+
+        await self.app(scope, receive, send_without_oauth_hint)
+
+
+class _LocalBearerInjector:
+    """ASGI middleware: inject the stable local-agent bearer for a loopback
+    caller with no Authorization header of its own, so 127.0.0.1 agents
+    (local sessions and automations) keep working once OAuth is enabled.
+
+    Never injects when the request carries cf-connecting-ip or
+    x-forwarded-for, even from a loopback peer. Those headers mean the
+    request arrived via a proxy (the Cloudflare tunnel today, any future hop
+    tomorrow); the only thing distinguishing "really came from 127.0.0.1"
+    from "internet request that a dropped/rewritten proxy hop made LOOK like
+    it came from 127.0.0.1" is the absence of that proxy's own fingerprint.
+    A request that carries one must authenticate for real. See
+    atlas-mcp-loopback-bearer-inje-20260909224207.
+    """
+
+    def __init__(self, asgi_app, local_token: str):
+        self.app = asgi_app
+        self.local_token = local_token
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http":
+            client = scope.get("client") or ("", 0)
+            headers = scope.get("headers", [])
+            has_authorization = any(k.lower() == b"authorization" for k, _ in headers)
+            arrived_via_proxy = any(k.lower() in _PROXY_ORIGIN_HEADERS for k, _ in headers)
+            if client[0] in ("127.0.0.1", "::1") and not has_authorization and not arrived_via_proxy:
+                scope = dict(scope)
+                scope["headers"] = list(scope["headers"]) + [
+                    (b"authorization", b"Bearer " + self.local_token.encode())
+                ]
+        await self.app(scope, receive, send)
 
 
 def _model_to_dict(obj: Any) -> Any:
@@ -353,29 +503,6 @@ def _log_session_lifecycle(
     )
 
 
-def _extract_tool_name(body: bytes) -> str:
-    if not body:
-        return ""
-    try:
-        payload = json.loads(body.decode("utf-8"))
-    except Exception:
-        return ""
-
-    if not isinstance(payload, dict):
-        return ""
-
-    method = payload.get("method")
-    if method != "tools/call":
-        return ""
-
-    params = payload.get("params")
-    if isinstance(params, dict):
-        name = params.get("name")
-        if isinstance(name, str):
-            return name
-    return ""
-
-
 MCP_INSTRUCTIONS = """You are connected to an Atlas canonical entity store.
 
 Atlas is the single source of truth for stack definitions: projects, services, servers, agents, rules, and vocabularies.
@@ -393,24 +520,25 @@ Read tools:
 
 Bridge / output tools:
 - get_kb_doc(name): read a knowledge base doc from the configured KB doc root (e.g. "Start Here.md")
-- create_kb_doc(path, content, confirm?, commit?): create docs/kb markdown via Atlas (single sanctioned write path; degenerate payloads — empty, unexpanded $(...) substitutions, __PLACEHOLDER__ tokens — are refused)
-- update_kb_doc(path, content, confirm?, commit?, allow_shrink?): update docs/kb markdown via Atlas (single sanctioned write path; FULL-FILE overwrite — degenerate payloads are refused, and content far smaller than the existing doc is refused unless allow_shrink=True)
-- append_kb_doc(path, content, expected_hash?, confirm?, commit?): append text to a KB doc server-side (no full-file round-trip; truncation-safe)
-- replace_kb_section(path, anchor, content, create_missing?, expected_hash?, confirm?, commit?, allow_whole_file?): replace one markdown section's body by heading anchor, leaving the rest intact (H1 anchors that span the whole doc are refused unless allow_whole_file=True)
-- check_drift(service_id?, force?): reality probes — reads cached result by default; force=True runs live
+- create_kb_doc(path, content, actor, doc_type?, confirm?, commit?): create docs/kb markdown via Atlas (single sanctioned write path; degenerate payloads — empty, unexpanded $(...) substitutions, __PLACEHOLDER__ tokens — are refused)
+- update_kb_doc(path, content, actor, confirm?, commit?, allow_shrink?): update docs/kb markdown via Atlas (single sanctioned write path; FULL-FILE overwrite — degenerate payloads are refused, and content far smaller than the existing doc is refused unless allow_shrink=True)
+- append_kb_doc(path, content, actor, expected_hash?, confirm?, commit?): append text to a KB doc server-side (no full-file round-trip; truncation-safe)
+- replace_kb_section(path, anchor, content, actor, create_missing?, expected_hash?, confirm?, commit?, allow_whole_file?): replace one markdown section's body by heading anchor, leaving the rest intact (H1 anchors that span the whole doc are refused unless allow_whole_file=True)
+- Every KB write takes `actor` ('<tool>/<model>' or 'process:<id>') and stamps OKF frontmatter `generated: {by, at}`; a 'human:' actor is refused. Convention: the OKF spec, https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md
+- check_drift(service_id?, force?): reality probes — reads the probe timer's last result with its age and REFUSES one older than 30 minutes; force=True or a service_id runs live. A fresh install has no probe timer: call check_drift(force=True) or pass a service_id until one is set up
 
 Write tools (propose-confirm pattern — preview first, then confirm=True to apply):
 - add_project(id, name, summary, category, status, concept_doc, gdrive_folder?, domain_tags?): add new project (autonomous)
 - update_project(id, confirm?, status?, category?, summary?, domain_tags?, ...): update project fields
 - add_service(id, name, summary, service_type, lifecycle, deployment_path, ...): add new service (autonomous)
 - update_service(id, confirm?, lifecycle?, port?, ...): update service fields
+  (changing expected_state — running_required | on_demand | allowed_stopped | retired_ignore — requires `reason`; `aliases` records other names)
+- set_exposure(id, who, reason, how?, hostnames?, forwards?, ...): record who may reach a service from the internet (the only sanctioned way to write `exposure`)
 - retire_service(id, confirm?): set service lifecycle to retired
-- set_maintenance(id, hours, reason, confirm?): declare a maintenance window (until = now+hours); while active, probes pass and restart-lock lifts for this service (Gate 1.1 — state-derived authority)
+- set_maintenance(id, hours, reason, confirm?): declare a maintenance window (until = now+hours); while active, probes pass and restart-lock lifts for this service (state-derived authority)
 - clear_maintenance(id, confirm?): end a declared maintenance window early
 - add_task(project, title, next_action, closure_test, ...): add canonical task (autonomous)
 - update_task(id, confirm?, status?, priority?, ...): update task fields
-- talos_queue_build(goal, repo, closure_test, constraints?, title?): queue an autonomous build for Talos (dictate-to-build watcher on project 'talos'); autonomous
-- talos_status / talos_list_builds / talos_cancel / talos_requeue: inspect and manage Talos build lifecycle (status+outcome, list, cancel a queued build, re-queue a finished/cancelled one)
 
 Task query tools:
 - get_task(id): read one task
@@ -449,6 +577,33 @@ def _resolve_mcp_instructions() -> str:
 # server (see tools/atlas_oauth.py). Until then this block is inert and the server
 # behaves exactly as before (X-API-Key + localhost bypass).
 _OAUTH_ENABLED = os.environ.get("ATLAS_OAUTH_ENABLED", "").lower() in ("1", "true", "yes")
+
+# Loopback is not an identity. A host-network
+# container shares 127.0.0.1, so "no Authorization header from loopback" handed any
+# such container the local-agent bearer. With injection off (the default) nothing is
+# injected: local agents send `Authorization: Bearer <token>` themselves, reading it
+# from LOCAL_TOKEN_FILE (written here at startup, mode 600 — readable by the service user and
+# root on the host, not by anything inside a container). Off by default; set
+# ATLAS_LOCAL_BEARER_INJECT=1 only to roll back.
+_LOCAL_BEARER_INJECT = os.environ.get("ATLAS_LOCAL_BEARER_INJECT", "0") == "1"
+LOCAL_TOKEN_FILE = Path(os.environ.get(
+    "ATLAS_LOCAL_TOKEN_FILE", str(REPO_ROOT / ".secrets" / "local_agent_token.txt")))
+
+
+def _publish_local_token(token: str) -> None:
+    """Write the local-agent bearer to LOCAL_TOKEN_FILE (0600, atomic) if it changed."""
+    try:
+        if LOCAL_TOKEN_FILE.exists() and LOCAL_TOKEN_FILE.read_text(encoding="utf-8").strip() == token:
+            return
+        LOCAL_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = LOCAL_TOKEN_FILE.with_suffix(".tmp")
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(token + "\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, LOCAL_TOKEN_FILE)
+    except OSError as exc:
+        logging.getLogger("atlas_mcp").error("could not publish local-agent token: %s", exc)
 _atlas_oauth_provider = None
 _atlas_auth_kwargs: dict[str, Any] = {}
 if _OAUTH_ENABLED:
@@ -493,208 +648,6 @@ def stack_summary() -> dict[str, Any]:
     return summary
 
 
-# ------------------------------------------------------------- demand log ---
-# The capability ledger measures SUPPLY: what exists, and whether it ran.
-# Nothing recorded DEMAND — what was asked for, and whether the stack could
-# answer. Without demand, a gap is only findable by a human reading 150 rows,
-# which is the manual audit this is meant to replace. Every ask appends one
-# line here; automations/scripts/capability_demand.py rolls it up.
-DEFAULT_DEMAND_LOG = "/opt/stack/services/automations/state/capability_asks.jsonl"
-
-
-def _demand_log() -> Path:
-    """Resolved per call, not at import: tests point it at a fixture without
-    reloading the module, and reloading was silently returning the cached
-    module — every 'reloaded' assertion was checking the first import."""
-    return Path(os.environ.get("ATLAS_DEMAND_LOG", DEFAULT_DEMAND_LOG))
-
-ASK_OUTCOMES = {
-    "hit",    # something exists and is usable (a LIVE or IDLE match)
-    "stale",  # only DEAD/UNKNOWN matched — something exists, nothing usable
-    "miss",   # nothing matched at all
-    "built",  # the ask was answered by building the capability
-    "error",  # the lookup itself failed; NOT evidence about the stack
-}
-
-
-def _record_ask(query: str, outcome: str, source: str,
-                matched: list[str] | tuple[str, ...] = (), note: str = "") -> bool:
-    """Append one ask to the demand log.
-
-    Best-effort by design: a telemetry write must never fail the tool call it is
-    observing. A demand log that can take down find_capability would be worse
-    than no demand log.
-    """
-    record = {
-        "at": _now_iso(),
-        "query": " ".join(str(query or "").split())[:300],
-        "outcome": outcome if outcome in ASK_OUTCOMES else "error",
-        "source": source,
-        "top": matched[0] if matched else None,
-        "matched": list(matched)[:3],
-        "note": note[:200],
-    }
-    try:
-        log = _demand_log()
-        log.parent.mkdir(parents=True, exist_ok=True)
-        # One line, one write, O_APPEND: concurrent writers interleave records,
-        # never halves of a record.
-        with log.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-        return True
-    except Exception:
-        logging.getLogger(__name__).debug("demand log write failed", exc_info=True)
-        return False
-
-
-@mcp.tool()
-def record_capability_ask(query: str, outcome: str, capability_ids: str = "",
-                          note: str = "") -> dict[str, Any]:
-    """Record a capability ask that was answered WITHOUT calling find_capability.
-
-    The SessionStart digest deliberately removes the lookup round-trip, so most
-    asks now get answered straight from context and leave no trace. That is a
-    win for latency and a hole in the demand signal; this closes it.
-
-    Call this once per capability question you answer — "do we have something
-    for X", "what runs Y", or a request that turned out to need a build.
-
-      query           what was asked, in the asker's words
-      outcome         hit | stale | miss | built
-                        hit    a usable capability already existed
-                        stale  something exists but is DEAD/UNKNOWN/unusable
-                        miss   nothing exists for this
-                        built  the gap was closed by building it
-      capability_ids  comma-separated ids you pointed at, most relevant first
-      note            anything the query alone would not tell a later reader
-    """
-    if outcome not in ASK_OUTCOMES:
-        return {"recorded": False,
-                "error": f"outcome must be one of {sorted(ASK_OUTCOMES - {'error'})}"}
-    ids = [i.strip() for i in (capability_ids or "").split(",") if i.strip()]
-    ok = _record_ask(query, outcome, source="agent", matched=ids, note=note)
-    return {"recorded": ok, "log": str(_demand_log()),
-            "note": None if ok else "demand log unwritable; the ask was not recorded"}
-
-
-@mcp.tool()
-def find_capability(query: str, include_unknown: bool = True, limit: int = 12) -> dict[str, Any]:
-    """Find a stack capability by what it does, and report whether it is still used.
-
-    Answers "do we already have something for X?" — the question that keeps
-    getting answered wrong because capabilities are built and then forgotten.
-    Searches the capability ledger (services, reverse-proxied surfaces, and
-    Atlas MCP tools) by id, name, summary, and invocation path.
-
-    Each hit carries `state` and `evidence`:
-      LIVE     used within 30 days; evidence names the journal entry or request count
-      IDLE     an invocation path exists, but nothing walked it in that window
-      DEAD     no invocation path found at all
-      UNKNOWN  no evidence source exists for this class — NOT a claim that it works
-
-    The ledger is written daily by capability-ledger.timer on the host. If it is
-    missing or stale, that is reported rather than papered over.
-    """
-    ledger_path = Path(os.environ.get(
-        "ATLAS_CAPABILITY_LEDGER",
-        "/opt/stack/services/automations/state/capability_ledger.json"))
-    try:
-        ledger = json.loads(ledger_path.read_text())
-    except Exception as exc:
-        # Recorded as `error`, never as `miss`: a broken ledger is not evidence
-        # that the stack lacks the capability, and scoring it as a gap would
-        # manufacture build proposals out of an outage.
-        _record_ask(query, "error", "find_capability", note=f"ledger unreadable: {exc}")
-        return {"error": True,
-                "reason": f"capability ledger unreadable ({exc}); "
-                          "check capability-ledger.timer on the host",
-                "results": []}
-
-    # Question words carry no signal and match everything — "queue a build"
-    # otherwise scores all 150 rows on the "a".
-    STOPWORDS = {
-        "a", "an", "the", "and", "or", "for", "to", "of", "in", "on", "is", "are",
-        "do", "does", "we", "i", "my", "our", "what", "which", "how", "can", "any",
-        "have", "has", "that", "this", "with", "use", "used", "using", "run",
-        "something", "anything", "thing", "stuff", "get", "there",
-    }
-    # Crude suffix stripping, enough to bridge execution/executor/executes and
-    # alerting/alert. Not a real stemmer, and not pretending to be one.
-    SUFFIXES = ("tion", "ing", "ion", "ers", "er", "or", "es", "ed", "ly", "s")
-
-    def stem(word: str) -> str:
-        for suf in SUFFIXES:
-            if len(word) - len(suf) >= 4 and word.endswith(suf):
-                return word[: -len(suf)]
-        return word
-
-    terms = [t for t in (w.strip(".,?!'\"") for w in query.lower().split())
-             if t and t not in STOPWORDS and len(t) > 2]
-    if not terms:
-        _record_ask(query, "error", "find_capability", note="no searchable terms")
-        return {"query": query, "match_count": 0, "returned": 0, "results": [],
-                "note": "query had no searchable terms after stopword removal"}
-
-    scored: list[tuple[int, dict[str, Any]]] = []
-    for row in ledger.get("rows", []):
-        if not include_unknown and row["state"] == "UNKNOWN":
-            continue
-        ident = f"{row.get('id', '')} {row.get('name', '')}".lower()
-        haystack = " ".join((
-            ident, row.get("search_text", ""), row.get("summary", ""),
-            row.get("invoke", ""),
-        )).lower()
-
-        # Weight identifier hits above prose hits so `talos` beats a service
-        # that merely mentions talos in its summary. Exact beats stemmed.
-        score = 0
-        for t in terms:
-            s = stem(t)
-            if t in ident:
-                score += 10
-            elif s in ident:
-                score += 6
-            elif t in haystack:
-                score += 2
-            elif s in haystack:
-                score += 1
-        if score:
-            scored.append((score, row))
-
-    order = {"LIVE": 0, "IDLE": 1, "DEAD": 2, "UNKNOWN": 3}
-    scored.sort(key=lambda p: (-p[0], order.get(p[1]["state"], 9), p[1]["id"]))
-
-    results = [{
-        "id": r["id"],
-        "class": r["class"],
-        "state": r["state"],
-        "summary": r.get("summary", ""),
-        "invoke": r.get("invoke", ""),
-        "last_used": r.get("last_used_human"),
-        "evidence": r.get("evidence", ""),
-    } for _, r in scored[:limit]]
-
-    # `stale` is the interesting outcome: the query DID match something, but
-    # nothing usable. Folding it into `hit` would hide the case where a
-    # capability exists on paper and cannot answer the ask.
-    if not results:
-        outcome = "miss"
-    elif any(r["state"] in ("LIVE", "IDLE") for r in results):
-        outcome = "hit"
-    else:
-        outcome = "stale"
-    _record_ask(query, outcome, "find_capability", matched=[r["id"] for r in results[:3]])
-
-    return {
-        "query": query,
-        "generated_at": ledger.get("generated_at"),
-        "match_count": len(scored),
-        "returned": len(results),
-        "results": results,
-        "note": "UNKNOWN means unmeasured, not working. Read `evidence` before acting.",
-    }
-
-
 @mcp.tool()
 def list_projects(category: str = "", status: str = "") -> list[dict[str, Any]]:
     """List all projects. Optionally filter by category (e.g. 'current', 'live', 'blocked', 'defer', 'archive') or status."""
@@ -717,16 +670,108 @@ def list_projects(category: str = "", status: str = "") -> list[dict[str, Any]]:
     return result
 
 
+# Working KB folders (10-CONCEPT, 20-DESIGN, 30-CONTEXT, ...) -- the same set
+# project-state loader reads. 40-OUTPUT is
+# excluded on purpose: it holds regenerated reports whose nightly mtime says
+# nothing about whether a decision has outrun the entity.
+_PROJECT_WORKING_FOLDER = re.compile(r"^(1\d|2\d|3\d)-")
+_PROJECT_STALE_GRACE = timedelta(minutes=5)
+
+
+def _project_kb_folder(entity: dict[str, Any]) -> Path | None:
+    """docs/kb/Projects/<Name>/... from concept_doc, else a folder named like the
+    project. Mirrors project_state.kb_folder so both readers agree."""
+    projects_root = _kb_doc_root() / "Projects"
+    m = re.search(r"docs/kb/Projects/([^/]+)/", str(entity.get("concept_doc") or ""))
+    if m and (projects_root / m.group(1)).is_dir():
+        return projects_root / m.group(1)
+    name = str(entity.get("name") or "")
+    for cand in (name, name.replace(" — ", " - ")):
+        if cand and (projects_root / cand).is_dir():
+            return projects_root / cand
+    return None
+
+
+def _newest_decision_entry(text: str) -> str:
+    """The last '## ' section of a DECISIONS.md, verbatim (entries are appended
+    in date order, so the last one is the newest)."""
+    starts = [m.start() for m in re.finditer(r"(?m)^## ", text)]
+    if not starts:
+        return text.strip()
+    return text[starts[-1]:].strip()
+
+
+def _project_staleness(entity: dict[str, Any]) -> dict[str, Any] | None:
+    """Staleness check on read: compare the
+    entity's updated_at against the newest mtime in the project's KB working
+    folders; when the doc is newer, return a STALE line (entity date, doc date,
+    gap) and the newest DECISIONS.md entry verbatim. None when not stale or
+    when there is nothing to compare."""
+    folder = _project_kb_folder(entity)
+    if folder is None:
+        return None
+    docs: list[Path] = []
+    for sub in sorted(folder.iterdir()):
+        if sub.is_dir() and _PROJECT_WORKING_FOLDER.match(sub.name):
+            docs.extend(sub.rglob("*.md"))
+    if not docs:
+        return None
+    newest = max(docs, key=lambda d: d.stat().st_mtime)
+    doc_dt = datetime.fromtimestamp(newest.stat().st_mtime, tz=timezone.utc)
+    raw = entity.get("updated_at")
+    if isinstance(raw, datetime):
+        ent_dt = raw if raw.tzinfo else raw.replace(tzinfo=timezone.utc)
+    else:
+        try:
+            ent_dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if ent_dt.tzinfo is None:
+            ent_dt = ent_dt.replace(tzinfo=timezone.utc)
+    # Grace: a KB doc written in the same operation as the entity (seconds
+    # apart -- typically a few seconds) is not staleness.
+    if doc_dt - ent_dt <= _PROJECT_STALE_GRACE:
+        return None
+    gap = doc_dt - ent_dt
+    hours = gap.total_seconds() / 3600
+    gap_s = f"{gap.days}d {int(hours % 24)}h" if gap.days else f"{hours:.1f}h"
+    rel = newest.relative_to(_kb_doc_root())
+    out: dict[str, Any] = {
+        "STALE": (
+            f"STALE: entity updated {ent_dt.strftime('%Y-%m-%dT%H:%M:%SZ')}; "
+            f"newest KB doc {rel} modified {doc_dt.strftime('%Y-%m-%dT%H:%M:%SZ')}; "
+            f"gap {gap_s}. Trust the KB; update next_action/last_done via update_project."
+        ),
+    }
+    decisions = folder / "20-DESIGN" / "DECISIONS.md"
+    if decisions.is_file():
+        out["newest_decision_verbatim"] = _newest_decision_entry(
+            decisions.read_text(encoding="utf-8", errors="replace"))
+    return out
+
+
 @mcp.tool()
 def get_project(id: str) -> dict[str, Any]:
-    """Return the full project entity for the given id."""
+    """Return the full project entity for the given id.
+
+    When the project's KB working folders hold a doc newer than the entity's
+    updated_at, the result OPENS with a `STALE` key (entity date, doc date,
+    gap) and `newest_decision_verbatim` (the last DECISIONS.md entry), ahead
+    of the entity fields. Checked on every read."""
     store = _get_store()
     projects = store.get("project", {})
     project = projects.get(id)
     if project is None:
         ids = sorted(projects.keys())
         raise ValueError(f"Project '{id}' not found. Known ids: {ids}")
-    return _model_to_dict(project)
+    entity = _model_to_dict(project)
+    try:
+        stale = _project_staleness(entity)
+    except OSError as exc:
+        stale = {"STALE": f"staleness check could not read the KB folder: {exc}"}
+    if stale:
+        return {**stale, **entity}
+    return entity
 
 
 @mcp.tool()
@@ -1010,11 +1055,9 @@ def list_servers() -> list[dict[str, Any]]:
 def list_vocabularies() -> list[dict[str, Any]]:
     """List every vocabulary with its legal value_ids inline.
 
-    Call this before any write. Vocab-valued arguments on add_*/update_* tools take a
-    bare value_id (e.g. 'systemd_unit', not 'vocab:service_types:systemd_unit'), and an
-    unknown value_id is rejected before the write — nothing is committed. This is the
-    only way to discover the legal set; guessing is what put four unresolvable refs into
-    a live consumer_profile in 2026-07.
+    Vocab-valued arguments on add_*/update_* tools take a bare value_id (e.g.
+    'systemd_unit', not 'vocab:service_types:systemd_unit'), and an unknown value_id is
+    rejected before the write — nothing is committed.
     """
     store = _get_store()
     vocabs = store.get("vocabulary", {})
@@ -1660,6 +1703,51 @@ def update_consumer_profile(
     )
 
 
+# Conservative RAM budget defaults per service_type, applied by add_service() when
+# the caller doesn't pass resource_budget_ram_mb explicitly. Closes
+# monitoring_resource_budget_gap AT THE SOURCE: every service created via the
+# sanctioned write path gets a non-null budget by construction instead of needing a
+# manual follow-up YAML edit to clear the drift flag (atlas-add-service-add-optional-
+# 20260804055054). These are deliberately conservative starting points, not measured
+# baselines — update the entity's resource_budget_ram_mb once real profiling exists.
+# cloudflare_worker/cloudflare_pages are intentionally absent: RAM budget is not
+# applicable to Cloudflare edge compute (rule service-resource-budget-present, and
+# _CLOUDFLARE_TYPES in extensions/<estate>/generators/monitoring_coverage_check.py).
+_DEFAULT_RAM_BUDGET_MB: dict[str, int] = {
+    "mcp_http": 128,
+    "mcp_stdio": 64,
+    "fastapi": 128,
+    "docker_container": 256,
+    "systemd_unit": 256,  # Python baseline
+    "nginx_vhost": 32,
+}
+
+
+def _reject_malformed_health_endpoint(health_endpoint: str) -> None:
+    """Refuse a health_endpoint the prober cannot probe, at write time.
+
+    Malformed values (prose around a URL, or a bare path like '/healthz') used
+    to crash every probe run. The prober now isolates such a row, but the value
+    is still wrong -- reject it
+    here, where the writer can fix it, with the same shape check the probe uses."""
+    problem = health_endpoint_problem(health_endpoint)
+    if problem is not None:
+        raise ValueError(
+            f"health_endpoint {health_endpoint!r} is not probeable: {problem}. "
+            "Give an absolute http(s) URL, e.g. http://127.0.0.1:8080/healthz; "
+            "put caveats in summary, not in this field."
+        )
+
+
+def _resolve_resource_budget_ram_mb(service_type: str, explicit: int | None) -> int | None:
+    """Pure helper: an explicit value always wins; otherwise fall back to the
+    conservative per-service_type default, or None if the type has no default
+    (e.g. cloudflare_worker/cloudflare_pages, or a future type not yet mapped)."""
+    if explicit is not None:
+        return explicit
+    return _DEFAULT_RAM_BUDGET_MB.get(service_type)
+
+
 @mcp.tool()
 def add_service(
     id: str,
@@ -1681,8 +1769,16 @@ def add_service(
     protected_high_use: str = "",
     remote: str = "",
     review_by: str = "",
+    resource_budget_ram_mb: int | None = None,
+    reason: str = "",
+    set_by: str = "",
+    aliases: list[str] | None = None,
 ) -> dict[str, Any]:
     """Add a new service entity to the Atlas store. Autonomous — writes and commits immediately.
+
+    expected_state says whether it is meant to run: running_required, on_demand,
+    allowed_stopped or retired_ignore. Give `reason` with it (why it is meant to
+    be in that state) and `set_by` (who decided). aliases: other names people use.
 
     Vocab value_ids are validated before the write; an unknown value is rejected and
     nothing is committed. Call list_vocabularies() for the live legal set.
@@ -1693,7 +1789,7 @@ def add_service(
     host: TypedRef string, default 'server:example-host'
     owned_by: TypedRef string, e.g. 'project:atlas' (optional)
     owns_units: every systemd unit and container this service owns, e.g.
-                ['aegis.timer', 'aegis-digest.timer', 'aegis-metrics.timer'].
+                ['app.service', 'app-digest.timer', 'app-metrics.timer'].
                 This is the authoritative reality binding — the capability
                 ledger reports anything on the box that no entity claims here.
                 Declare all of them; one logical service commonly owns several
@@ -1702,10 +1798,18 @@ def add_service(
     review_by: ISO date for anything temporary. Register things you intend to
                retire immediately — the tombstone is the point — but give a
                temporary thing a date so it cannot quietly become permanent.
+    resource_budget_ram_mb: optional RAM budget in MB. If omitted, a conservative
+               default is applied per service_type (see _DEFAULT_RAM_BUDGET_MB) —
+               e.g. systemd_unit/docker_container get a 256 MB Python baseline,
+               mcp_stdio 64 MB. cloudflare_worker/cloudflare_pages get no default
+               (not applicable — CPU-time-limited, not RAM-budgeted). Pass an
+               explicit value to override the default.
     """
     store = _get_store()
     if id in store.get("service", {}):
         raise ValueError(f"Service '{id}' already exists. Use update_service to modify it.")
+    if health_endpoint:
+        _reject_malformed_health_endpoint(health_endpoint)
 
     now = _now_iso()
     data: dict[str, Any] = {
@@ -1738,10 +1842,18 @@ def add_service(
         data["tier"] = tier
     if expected_state:
         data["expected_state"] = expected_state
+        data["expected_state_reason"] = reason.strip() or "set when the service was registered"
+        data["expected_state_set_by"] = (set_by or "atlas-mcp").strip()
+        data["expected_state_since"] = now
+    if aliases:
+        data["aliases"] = [str(a).strip() for a in aliases if str(a).strip()]
     if protected_high_use:
         data["protected_high_use"] = protected_high_use.strip().lower() in {"1", "true", "yes", "on"}
     if remote:
         data["remote"] = remote
+    budget = _resolve_resource_budget_ram_mb(service_type, resource_budget_ram_mb)
+    if budget is not None:
+        data["resource_budget_ram_mb"] = budget
 
     return _write_and_commit("services", id, data, f"feat: add service {id} via Atlas Write API")
 
@@ -1766,10 +1878,19 @@ def update_service(
     publication_disposition: str = "",
     publication_target: str = "",
     review_by: str = "",
+    resource_budget_ram_mb: int | None = None,
+    reason: str = "",
+    set_by: str = "",
+    aliases: list[str] | None = None,
 ) -> dict[str, Any]:
     """Update fields on an existing service entity.
 
     Returns a before/after preview when confirm=False (default). Call again with confirm=True to apply.
+    expected_state (running_required | on_demand | allowed_stopped | retired_ignore)
+    says whether the service is meant to run. Changing it REQUIRES `reason` — why
+    it is meant to be in that state — and records who (`set_by`) and when. This is
+    how "stopped on purpose" is written down so nothing reports it as a problem.
+    aliases REPLACES the list of other names the service answers to.
     lifecycle accepts value_ids — one of: running, maintained, degraded, retired.
     publication_disposition is one of private|fold|standalone|cookbook|undecided;
     publication_target is the repo name (required for fold/standalone).
@@ -1777,11 +1898,22 @@ def update_service(
     set of units/containers this service owns, or the ones you leave out become
     UNREGISTERED on the capability ledger.
     review_by is an ISO date for anything temporary.
+    resource_budget_ram_mb: RAM budget in MB (positive int). None (the default)
+               means LEAVE UNCHANGED, like every other argument here -- so this
+               tool cannot clear a budget back to unset; that needs a YAML edit.
+    health_endpoint must be an absolute http(s) URL; a malformed value is refused.
     """
     store = _get_store()
     services = store.get("service", {})
     if id not in services:
         raise ValueError(f"Service '{id}' not found. Known ids: {sorted(services.keys())}")
+    if health_endpoint:
+        _reject_malformed_health_endpoint(health_endpoint)
+    if resource_budget_ram_mb is not None and (
+        isinstance(resource_budget_ram_mb, bool) or int(resource_budget_ram_mb) != resource_budget_ram_mb
+        or resource_budget_ram_mb <= 0
+    ):
+        raise ValueError(f"resource_budget_ram_mb must be a positive integer (MB), got {resource_budget_ram_mb!r}")
 
     rel_path = f"entities/services/{id}.yaml"
     abs_path = REPO_ROOT / rel_path
@@ -1807,7 +1939,16 @@ def update_service(
     if tier:
         after["tier"] = tier
     if expected_state:
+        if expected_state != current_data.get("expected_state") and not reason.strip():
+            raise ValueError("reason is required when expected_state changes: say why the "
+                             "service is meant to be in that state")
         after["expected_state"] = expected_state
+    if expected_state and (reason.strip() or expected_state != current_data.get("expected_state")):
+        after["expected_state_reason"] = reason.strip()
+        after["expected_state_set_by"] = (set_by or "atlas-mcp").strip()
+        after["expected_state_since"] = _now_iso()
+    if aliases is not None:
+        after["aliases"] = [str(a).strip() for a in aliases if str(a).strip()]
     if protected_high_use:
         after["protected_high_use"] = protected_high_use.strip().lower() in {"1", "true", "yes", "on"}
     if source_of_truth_doc:
@@ -1820,6 +1961,8 @@ def update_service(
         after["publication_disposition"] = publication_disposition
     if publication_target:
         after["publication_target"] = publication_target
+    if resource_budget_ram_mb is not None:
+        after["resource_budget_ram_mb"] = int(resource_budget_ram_mb)
     after["updated_at"] = _now_iso()
 
     if not confirm:
@@ -1881,10 +2024,10 @@ def retire_service(id: str, confirm: bool = False, reason: str = "",
 def set_maintenance(id: str, hours: float, reason: str, confirm: bool = False) -> dict[str, Any]:
     """Declare a maintenance window on a service.
 
-    Gate 1.1 (2026-07-27): persona restart/alert authority derives from entity
+    Persona restart/alert authority derives from entity
     STATE, not a static allowlist. While the window is active (unexpired),
     probe_runner's _apply_maintenance() passes every probe for this service --
-    no drift, no Aegis service_unhealthy -- and anything consulting
+    no drift, no service_unhealthy alert -- and anything consulting
     schemas.service.maintenance_active() must treat the entity as unlocked for
     restart. `until` = now + hours (UTC), computed here so callers declare a
     duration, not a timestamp.
@@ -1973,6 +2116,237 @@ def clear_maintenance(id: str, confirm: bool = False) -> dict[str, Any]:
 
 
 @mcp.tool()
+def set_exposure(
+    id: str,
+    who: str,
+    reason: str,
+    how: str = "",
+    hostnames: list[str] | None = None,
+    forwards: list[str] | None = None,
+    source_ips: list[str] | None = None,
+    until: str = "",
+    recorded_by: str = "",
+    replace_all: bool = False,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """Record one door into a service from the internet: who may reach it, how, and why.
+
+    The only sanctioned way to write `exposure` (it was hand-edited until
+    2026-11-11, which is how a record the schema refuses got into the store).
+    who:  public | family | operator | none
+    how:  tunnel (public, no login) | tunnel+access (Cloudflare login first; operator or
+          family) | forward (router port forward). Leave empty with who=none.
+    hostnames: public names this door covers. forwards: external router ports.
+    source_ips + until (YYYY-MM-DD): a forward limited to certain addresses.
+
+    The new door replaces any recorded door that shares a hostname or forward
+    with it; other doors are kept. replace_all=True makes it the only door.
+    who=none records "no door from the internet" and always replaces the list.
+    Validated before anything is written. Returns a preview when confirm=False.
+    """
+    store = _get_store()
+    services = store.get("service", {})
+    if id not in services:
+        raise ValueError(f"Service '{id}' not found. Known ids: {sorted(services.keys())}")
+
+    rel_path = f"entities/services/{id}.yaml"
+    abs_path = REPO_ROOT / rel_path
+    current_data: dict[str, Any] = yaml.safe_load(abs_path.read_text(encoding="utf-8")) or {}
+
+    door: dict[str, Any] = {"who": who.strip()}
+    if how.strip():
+        door["how"] = how.strip()
+    door["reason"] = reason.strip()
+    names = [str(h).strip().lower() for h in hostnames or [] if str(h).strip()]
+    ports = [str(f).strip() for f in forwards or [] if str(f).strip()]
+    ips = [str(s).strip() for s in source_ips or [] if str(s).strip()]
+    if names:
+        door["hostnames"] = names
+    if ports:
+        door["forwards"] = ports
+    if ips:
+        door["source_ips"] = ips
+    if until.strip():
+        door["until"] = until.strip()
+    door["recorded_at"] = _now_iso()
+    door["recorded_by"] = (recorded_by or "atlas-mcp").strip()
+
+    before = current_data.get("exposure")
+    kept: list[Any] = []
+    if not replace_all and door["who"] != "none":
+        for old in before or []:
+            if not isinstance(old, dict) or old.get("who") == "none":
+                continue
+            shares = (set(names) & {str(h).lower() for h in old.get("hostnames") or []}) \
+                or (set(ports) & {str(f) for f in old.get("forwards") or []})
+            if not shares:
+                kept.append(old)
+    after = dict(current_data)
+    after["exposure"] = kept + [door]
+    after["updated_at"] = _now_iso()
+
+    if not confirm:
+        check = _validate_entity("services", id, after)
+        return {
+            "action": "preview",
+            "id": id,
+            "before": before,
+            "after": after["exposure"],
+            "errors": check.errors,
+            "note": f"Call set_exposure(id={id!r}, ..., confirm=True) with the same args to apply.",
+        }
+
+    result = _write_and_commit("services", id, after, f"chore: record exposure of service {id} via Atlas Write API")
+    if "error" not in result:
+        result["exposure"] = after["exposure"]
+    return result
+
+
+@mcp.tool()
+def set_public_api(
+    id: str,
+    routes: list[str],
+    reason: str,
+    route_source: str = "",
+    api_prefixes: list[str] | None = None,
+    recorded_by: str = "",
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """Declare which API routes of an internet-exposed service may answer anyone.
+
+    The only sanctioned way to write `public_api` (2026-11-16). routes are
+    "METHOD /path/template" exactly as the app's OpenAPI names them, e.g.
+    "GET /api/setup/status" or "POST /api/auth/login". An API exposure probe
+    can call every API route with no credentials and flag any 2xx from a route
+    not listed here.
+    route_source: an OpenAPI JSON URL when the public /openapi.json is not served.
+    api_prefixes: only paths under these are API routes (default ["/api/"] when the
+    app has any). Replaces the whole declaration. Returns a preview when confirm=False.
+    """
+    store = _get_store()
+    services = store.get("service", {})
+    if id not in services:
+        raise ValueError(f"Service '{id}' not found. Known ids: {sorted(services.keys())}")
+    if not reason.strip():
+        raise ValueError("reason is required")
+
+    rel_path = f"entities/services/{id}.yaml"
+    abs_path = REPO_ROOT / rel_path
+    current_data: dict[str, Any] = yaml.safe_load(abs_path.read_text(encoding="utf-8")) or {}
+
+    decl: dict[str, Any] = {"routes": [" ".join(str(r).split()) for r in routes if str(r).strip()]}
+    if route_source.strip():
+        decl["route_source"] = route_source.strip()
+    prefixes = [str(x).strip() for x in api_prefixes or [] if str(x).strip()]
+    if prefixes:
+        decl["api_prefixes"] = prefixes
+    decl["reason"] = reason.strip()
+    decl["recorded_at"] = _now_iso()
+    decl["recorded_by"] = (recorded_by or "atlas-mcp").strip()
+
+    before = current_data.get("public_api")
+    after = dict(current_data)
+    after["public_api"] = decl
+    after["updated_at"] = _now_iso()
+
+    if not confirm:
+        check = _validate_entity("services", id, after)
+        return {"action": "preview", "id": id, "before": before, "after": decl, "errors": check.errors,
+                "note": f"Call set_public_api(id={id!r}, ..., confirm=True) with the same args to apply."}
+
+    result = _write_and_commit("services", id, after, f"chore: declare public API routes of service {id} via Atlas Write API")
+    if "error" not in result:
+        result["public_api"] = decl
+    return result
+
+
+@mcp.tool()
+def set_quarantine(id: str, reason: str, set_by: str = "", confirm: bool = False) -> dict[str, Any]:
+    """Quarantine a service: a deliberate stop every self-heal and update job honors.
+
+    While active, every self-heal, reconcile, update and backup job that checks
+    quarantine_active() (schemas/service.py) must not start, restart, recreate or
+    update this service's containers or units.
+    It beats a maintenance window and an agent_restartable grant, and it never
+    expires on its own — call clear_quarantine() to lift it.
+
+    Use it whenever something is stopped on purpose and must stay down (an
+    incident, evidence being preserved). Returns a preview when confirm=False.
+    """
+    store = _get_store()
+    services = store.get("service", {})
+    if id not in services:
+        raise ValueError(f"Service '{id}' not found. Known ids: {sorted(services.keys())}")
+    if not reason.strip():
+        raise ValueError("reason is required")
+
+    rel_path = f"entities/services/{id}.yaml"
+    abs_path = REPO_ROOT / rel_path
+    current_data: dict[str, Any] = yaml.safe_load(abs_path.read_text(encoding="utf-8")) or {}
+
+    after = dict(current_data)
+    after["quarantine"] = {
+        "active": True,
+        "reason": reason.strip(),
+        "since": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "set_by": (set_by or "atlas-mcp").strip(),
+    }
+    after["updated_at"] = _now_iso()
+
+    if not confirm:
+        return {
+            "action": "preview",
+            "id": id,
+            "before": current_data.get("quarantine"),
+            "after": after["quarantine"],
+            "note": f"Call set_quarantine(id={id!r}, reason=..., confirm=True) to apply.",
+        }
+
+    result = _write_and_commit("services", id, after, f"chore: quarantine service {id} via Atlas Write API")
+    if "error" not in result:
+        result["quarantine"] = after["quarantine"]
+    return result
+
+
+@mcp.tool()
+def clear_quarantine(id: str, cleared_by: str = "", confirm: bool = False) -> dict[str, Any]:
+    """Lift a service's quarantine (sets active: false, keeps the record with who/when).
+
+    After this the normal rules apply again: self-heal may restart it if its own
+    authority allows. Returns a preview when confirm=False.
+    """
+    store = _get_store()
+    services = store.get("service", {})
+    if id not in services:
+        raise ValueError(f"Service '{id}' not found. Known ids: {sorted(services.keys())}")
+
+    rel_path = f"entities/services/{id}.yaml"
+    abs_path = REPO_ROOT / rel_path
+    current_data: dict[str, Any] = yaml.safe_load(abs_path.read_text(encoding="utf-8")) or {}
+
+    current = current_data.get("quarantine")
+    after = dict(current_data)
+    after["quarantine"] = {
+        **(current or {}),
+        "active": False,
+        "cleared_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "cleared_by": (cleared_by or "atlas-mcp").strip(),
+    }
+    after["updated_at"] = _now_iso()
+
+    if not confirm:
+        return {
+            "action": "preview",
+            "id": id,
+            "before": current,
+            "after": after["quarantine"],
+            "note": f"Call clear_quarantine(id={id!r}, confirm=True) to apply.",
+        }
+
+    return _write_and_commit("services", id, after, f"chore: clear quarantine on {id} via Atlas Write API")
+
+
+@mcp.tool()
 def add_task(
     project: str,
     title: str,
@@ -2018,6 +2392,9 @@ def add_task(
                     "task": payload,
                 }
 
+    now_dt = datetime.now(timezone.utc)
+    duplicate = _find_near_duplicate_task(project_id, title, now_dt)
+
     task_id = _next_task_id(project_id, title, normalized_source, source_request_id)
     now = _now_iso()
 
@@ -2056,247 +2433,21 @@ def add_task(
     result = _write_and_commit("tasks", task_id, data, f"feat: add task {task_id} via Atlas Write API")
     if "error" in result:
         return result
-    return {
+    response: dict[str, Any] = {
         "ok": True,
         "idempotent": False,
         "task_id": task_id,
         "project_id": project_id,
         **result,
     }
-
-
-@mcp.tool()
-def talos_queue_build(goal: str, repo: str, closure_test: str,
-                      constraints: list[str] | None = None, title: str = "") -> dict[str, Any]:
-    """Queue an autonomous build for Talos, the dictate-to-build executor.
-
-    Talos is a systemd watcher on the host that polls Atlas project 'talos'
-    every minute for open build-intent tasks, then runs headless Claude Code
-    (claude -p, flat-rate Max OAuth) in the target repo, commits + pushes the
-    result, writes the commit SHA back to this task, and pings Discord. Use this
-    to hand Talos a self-contained coding task to do unattended.
-
-    Provide:
-      goal:         what to build/change (the concrete outcome).
-      repo:         absolute target repo path. Talos operates default-allow
-                    inside /opt/stack/services/projects (protected existing
-                    projects are excluded); a new path under there is created.
-      closure_test: how to know it's done (load-bearing — an intent that can't
-                    state done is underspecified and bounces back).
-      constraints:  list of hard constraints (may be empty).
-      title:        optional short title; derived from goal if omitted.
-
-    Underspecified or ambiguous tasks are bounced to needs-clarification with a
-    Discord ping rather than guessed at. Returns the created task id.
-    """
-    if not isinstance(goal, str) or not goal.strip():
-        raise ValueError("goal must be a non-empty string describing what to build.")
-    if not isinstance(repo, str) or not repo.strip():
-        raise ValueError("repo must be a non-empty string (absolute target repo path).")
-    if not isinstance(closure_test, str) or not closure_test.strip():
-        raise ValueError("closure_test must be a non-empty string (how to know it's done).")
-
-    constraints = constraints or []
-    if not isinstance(constraints, list) or not all(isinstance(c, str) for c in constraints):
-        raise ValueError("constraints must be a list of strings.")
-
-    title = title.strip() if isinstance(title, str) else ""
-    if not title:
-        title = goal.strip()[:60]
-
-    project_id = _resolve_project_id("talos")
-    task_id = _next_task_id(project_id, title, "manual", "")
-    now = _now_iso()
-
-    notes = (
-        "Queued via talos_queue_build (Talos MCP front door).\n\n"
-        "```intent\n" + json.dumps({"repo": repo, "constraints": constraints}) + "\n```\n"
-    )
-
-    data: dict[str, Any] = {
-        "id": task_id,
-        "project_id": project_id,
-        "title": title,
-        "status": "open",
-        "priority": "high",
-        "task_type": "build-intent",
-        "next_action": goal,
-        "closure_test": closure_test,
-        "source": "manual",
-        "created_at": now,
-        "updated_at": now,
-        "notes": notes,
-    }
-
-    result = _write_and_commit("tasks", task_id, data, f"feat: queue talos build {task_id}")
-    if "error" in result:
-        return result
-    return {"ok": True, "task_id": task_id, "project_id": project_id, **result}
-
-
-# ---------------------------------------------------------------------------
-# Talos build lifecycle tools (status / list / cancel / requeue).
-# All operate only on project 'talos' tasks with task_type == 'build-intent'.
-# Talos is a systemd watcher that autonomously runs `claude -p` on any OPEN
-# build-intent task in project 'talos' — so flipping a task to 'open' (requeue)
-# hands it to an unattended build on the next poll (within a minute).
-# ---------------------------------------------------------------------------
-
-_TALOS_OUTCOME_VALUES = {"needs-review", "build-failed", "needs-clarification"}
-
-
-def _load_talos_build_task(task_id: str) -> dict[str, Any]:
-    """Load a Talos build-intent task as a plain dict.
-
-    Raises ValueError if the id doesn't exist or the task isn't a Talos build
-    task (project_id == 'talos' and task_type == 'build-intent')."""
-    store = _get_store()
-    tasks = store.get("task", {})
-    task = tasks.get(task_id)
-    if task is None:
-        raise ValueError(f"Talos build '{task_id}' not found.")
-    payload = _model_to_dict(task)
-    if payload.get("project_id") != "talos" or payload.get("task_type") != "build-intent":
-        raise ValueError(
-            f"Task '{task_id}' is not a Talos build "
-            f"(project_id={payload.get('project_id')!r}, task_type={payload.get('task_type')!r})."
+    if duplicate is not None:
+        response["duplicate_warning"] = (
+            f"possible duplicate: an existing task {duplicate['id']!r} "
+            f"(created {duplicate['created_at']}) in the same project has a near-identical "
+            f"title. Not blocked — review both and close one if they are the same work."
         )
-    return payload
-
-
-@mcp.tool()
-def talos_status(task_id: str) -> dict[str, Any]:
-    """Get the current state of a Talos build: status, outcome (needs-review with
-    commit SHA / build-failed / needs-clarification), and the disposition notes."""
-    payload = _load_talos_build_task(task_id)
-    return {
-        "task_id": task_id,
-        "title": payload.get("title"),
-        "status": payload.get("status"),
-        "outcome": payload.get("blocked_on") or None,
-        "goal": payload.get("next_action"),
-        "closure_test": payload.get("closure_test"),
-        "updated_at": payload.get("updated_at"),
-        "notes": payload.get("notes"),
-    }
-
-
-@mcp.tool()
-def talos_list_builds(limit: int = 20, state: str = "") -> dict[str, Any]:
-    """List recent Talos builds, newest first, optionally filtered by state
-    (open, in_progress, needs-review, build-failed, needs-clarification,
-    deferred, resolved)."""
-    if limit < 1 or limit > 1000:
-        raise ValueError("limit must be between 1 and 1000")
-
-    store = _get_store()
-    tasks = store.get("task", {})
-    builds: list[tuple[str, dict[str, Any]]] = []
-    for task_id, task in tasks.items():
-        payload = _model_to_dict(task)
-        if payload.get("project_id") != "talos" or payload.get("task_type") != "build-intent":
-            continue
-        builds.append((task_id, payload))
-
-    if state:
-        if state in _TASK_STATUS_VALUES:
-            builds = [b for b in builds if b[1].get("status") == state]
-        elif state in _TALOS_OUTCOME_VALUES:
-            builds = [b for b in builds if b[1].get("blocked_on") == state]
-        else:
-            allowed = sorted(_TASK_STATUS_VALUES | _TALOS_OUTCOME_VALUES)
-            raise ValueError(f"state must be empty or one of: {allowed}")
-
-    builds.sort(
-        key=lambda item: item[1].get("updated_at") or item[1].get("created_at"),
-        reverse=True,
-    )
-    builds = builds[:limit]
-
-    return {
-        "count": len(builds),
-        "builds": [
-            {
-                "id": task_id,
-                "title": payload.get("title"),
-                "status": payload.get("status"),
-                "outcome": payload.get("blocked_on") or None,
-                "updated_at": payload.get("updated_at"),
-            }
-            for task_id, payload in builds
-        ],
-    }
-
-
-@mcp.tool()
-def talos_cancel(task_id: str) -> dict[str, Any]:
-    """Cancel a queued (not-yet-started) Talos build by deferring it so the
-    watcher skips it."""
-    payload = _load_talos_build_task(task_id)
-    status = payload.get("status")
-    if status != "open":
-        blocked_on = payload.get("blocked_on")
-        reason = f"only a queued (open) build can be cancelled; this task is {status}"
-        if blocked_on:
-            reason += f"/{blocked_on}"
-        return {"ok": False, "task_id": task_id, "reason": reason}
-
-    rel_path = f"entities/tasks/{task_id}.yaml"
-    abs_path = REPO_ROOT / rel_path
-    after: dict[str, Any] = yaml.safe_load(abs_path.read_text(encoding="utf-8")) or {}
-    now = _now_iso()
-    existing_notes = after.get("notes") or ""
-    after["notes"] = (
-        existing_notes
-        + f"\n\n---\n[talos-cancel {now}] build cancelled by operator; Talos will not run it."
-    )
-    after["status"] = "deferred"
-    after.pop("resolved_at", None)
-    after["updated_at"] = now
-
-    result = _write_and_commit("tasks", task_id, after, f"chore: cancel talos build {task_id}")
-    if "error" in result:
-        return result
-    return {"ok": True, "task_id": task_id, "status": "deferred"}
-
-
-@mcp.tool()
-def talos_requeue(task_id: str, note: str = "") -> dict[str, Any]:
-    """Re-queue a finished or cancelled Talos build (e.g. after adding the missing
-    clarification the ping asked for) so the watcher runs it again. Preserves the
-    original intent; append a note describing what changed."""
-    payload = _load_talos_build_task(task_id)
-    status = payload.get("status")
-    if status == "in_progress":
-        return {
-            "ok": False,
-            "task_id": task_id,
-            "reason": "build is currently running; wait for it to finish before requeuing",
-        }
-
-    rel_path = f"entities/tasks/{task_id}.yaml"
-    abs_path = REPO_ROOT / rel_path
-    after: dict[str, Any] = yaml.safe_load(abs_path.read_text(encoding="utf-8")) or {}
-    now = _now_iso()
-    existing_notes = after.get("notes") or ""
-    line = f"\n\n---\n[talos-requeue {now}] re-queued for Talos"
-    if note:
-        line += f": {note}"
-    after["notes"] = existing_notes + line
-    after["status"] = "open"
-    after["blocked_on"] = ""
-    after.pop("resolved_at", None)
-    after["updated_at"] = now
-
-    result = _write_and_commit("tasks", task_id, after, f"chore: requeue talos build {task_id}")
-    if "error" in result:
-        return result
-    return {
-        "ok": True,
-        "task_id": task_id,
-        "status": "open",
-        "note": "Talos will pick it up on the next cycle (within a minute)",
-    }
+        response["duplicate_candidate_id"] = duplicate["id"]
+    return response
 
 
 @mcp.tool()
@@ -2708,12 +2859,8 @@ def sync_project_next_actions_from_tasks(project: str = "", confirm: bool = Fals
         "updated_projects": updated,
         "errors": errors,
     }
-
-
-DEFAULT_OUTPUTS_DIR = REPO_ROOT / "outputs"
-DEFAULT_KB_DOC_ROOT = Path("/opt/stack/services/docs/kb")
-DEFAULT_KB_OUTPUT_DIR = DEFAULT_KB_DOC_ROOT / "Projects" / "Atlas" / "40-OUTPUT"
-DEFAULT_SERVICES_REPO_ROOT = Path("/opt/stack/services")
+DEFAULT_KB_DOC_ROOT = REPO_ROOT / "docs" / "kb"
+DEFAULT_SERVICES_REPO_ROOT = REPO_ROOT
 KB_ROOT_ALLOWED_FILES = {
     "Start Here.md",
     "Standards.md",
@@ -2822,6 +2969,19 @@ def _git_commit_paths(repo_root: Path, rel_paths: list[str], message: str) -> di
     }
 
     with atlas_write_lock(repo_root):
+        # Folders kept off GitHub on purpose (.gitignore — private material):
+        # the doc is on disk, just not committed.
+        ignored = subprocess.run(
+            ["git", "check-ignore", "--", *rel_paths],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout.splitlines()
+        rel_paths = [p for p in rel_paths if p not in ignored]
+        if not rel_paths:
+            return {"ok": True, "sha": "", "committed": False,
+                    "note": f"written but not committed: git-ignored ({', '.join(ignored)})"}
         for rel_path in rel_paths:
             add = subprocess.run(
                 ["git", "add", "--", rel_path],
@@ -2882,12 +3042,39 @@ def _git_commit_paths(repo_root: Path, rel_paths: list[str], message: str) -> di
         }
 
 
+# Skill-load log: every pointer skill loads its canonical text through
+# get_kb_doc, from every surface (Code, chat, phone), so this is the one place
+# that sees all skill loads; a periodic misfire check can read it.
+DEFAULT_SKILL_LOAD_LOG = str(REPO_ROOT / "state" / "skill_loads.jsonl")
+_SKILL_DOC_RE = re.compile(r"^Projects/(skill-[^/]+)/40-CONTENT/SKILL\.md$")
+
+
+def _record_skill_load(name: str, context: str) -> None:
+    """Best-effort, like _record_ask: telemetry never fails the read."""
+    m = _SKILL_DOC_RE.match(name.strip().lstrip("/"))
+    if not m:
+        return
+    record = {"at": _now_iso(), "skill": m.group(1),
+              "context": " ".join(str(context or "").split())[:200]}
+    try:
+        log = Path(os.environ.get("ATLAS_SKILL_LOAD_LOG", DEFAULT_SKILL_LOAD_LOG))
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        logging.getLogger(__name__).debug("skill load log write failed", exc_info=True)
+
+
 @mcp.tool()
-def get_kb_doc(name: str) -> str:
+def get_kb_doc(name: str, context: str = "") -> str:
     """Read a knowledge base document from the configured KB doc root.
 
     Pass a relative path such as 'Start Here.md', 'Standards.md', or
     'Projects/atlas/10-CONCEPT/ATLAS_CONCEPT.md'. Returns the file content.
+
+    context: optional one line on what the conversation is about. Skill stubs
+    pass it when loading their canonical SKILL.md; it is logged (with the
+    skill id and time only) so misfiring skills can be found.
     """
     kb_root = Path(os.environ.get("ATLAS_KB_DOC_ROOT", str(DEFAULT_KB_DOC_ROOT)))
     target = (kb_root / name).resolve()
@@ -2900,8 +3087,9 @@ def get_kb_doc(name: str) -> str:
             "This KB root has no such document yet — create it via create_kb_doc "
             "or check the path with a directory-level doc listing."
         )
-    return target.read_text(encoding="utf-8")
-
+    text = target.read_text(encoding="utf-8")
+    _record_skill_load(name, context)
+    return text
 
 # --- KB degenerate-payload guard (create_kb_doc / update_kb_doc) -------------
 # Both tools take the ENTIRE document as `content`, so a payload that was never
@@ -2982,6 +3170,43 @@ def _kb_reject_degenerate_content(content: str, operation: str) -> None:
             )
 
 
+_LEAK_GATE = None
+
+
+def _leak_gate():
+    """tools/kb_secret_scan.py next to this file (secret-format rules only). If it
+    is missing every KB write is refused. Loaded once."""
+    global _LEAK_GATE
+    if _LEAK_GATE is None:
+        import importlib.util
+        path = Path(__file__).resolve().parent / "kb_secret_scan.py"
+        spec = importlib.util.spec_from_file_location("atlas_kb_leak_gate", path)
+        if spec is None or spec.loader is None or not path.is_file():
+            raise ValueError(f"Refusing KB write: the leak gate is missing ({path}); KB writes fail closed.")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod          # its dataclasses resolve their module here
+        spec.loader.exec_module(mod)
+        _LEAK_GATE = mod
+    return _LEAK_GATE
+
+
+def _kb_reject_secrets(content: str, operation: str) -> None:
+    """Refuse KB content that matches the leak gate's 'secrets' rules (API keys, access
+    key IDs, webhook URLs, private keys). KB docs are committed and often pushed, and a
+    credential that reaches git history takes a history rewrite to remove. The message
+    names the line and rule,
+    never the matched text. Applies at preview and confirm, to every KB write tool."""
+    hits = _leak_gate().scan_text(content, profile="secrets", source_label=operation)
+    if hits:
+        where = ", ".join(f"line {h.line} ({h.why})" for h in hits[:5])
+        more = f" and {len(hits) - 5} more" if len(hits) > 5 else ""
+        raise ValueError(
+            f"Refusing {operation}: content matches the leak gate's secret rules at {where}{more}. "
+            "KB docs are committed and pushed, so credential material must never be written here. "
+            "Remove it or write a redacted stub instead (for example AKIA…(redacted))."
+        )
+
+
 def _kb_reject_unacknowledged_shrink(existing: str, content: str, allow_shrink: bool) -> None:
     """Refuse a full-file overwrite dramatically smaller than the existing doc
     unless allow_shrink=True — the 2026-07-26 incident shape (394 lines -> 26)
@@ -3000,13 +3225,33 @@ def _kb_reject_unacknowledged_shrink(existing: str, content: str, allow_shrink: 
     )
 
 
+def _kb_stamp(content: str, existing: str | None, rel: Path, actor: str,
+              operation: str, doc_type: str = "") -> str:
+    """Stamp OKF `generated: {by, at}` on a KB write (tools/kb_frontmatter.py).
+    Exempt files (SKILL.md, generated indexes) pass through untouched."""
+    if kbfm.is_exempt(rel.as_posix()):
+        return content
+    return kbfm.stamp(content, existing, rel.as_posix(),
+                      kbfm.validate_actor(actor, operation), operation, doc_type)
+
+
 @mcp.tool()
-def create_kb_doc(path: str, content: str, confirm: bool = False, commit: bool = True) -> dict[str, Any]:
+def create_kb_doc(path: str, content: str, confirm: bool = False, commit: bool = True,
+                  actor: str = "", doc_type: str = "") -> dict[str, Any]:
     """Create a markdown document under the configured KB doc root via Atlas.
 
     Single sanctioned KB write path. Uses propose-confirm by default.
     Set confirm=True to apply the write. Degenerate payloads (empty/whitespace,
     unexpanded $(...) substitutions, __PLACEHOLDER__ tokens) are refused.
+
+    actor: REQUIRED. Who is writing, as '<tool>/<model>' (for example
+    'claude-code/claude-fable-5-2') or 'process:<id>' for automation. The tool
+    writes it into the doc's frontmatter as generated.by with the time. A
+    'human:' actor is refused: a session cannot record a person as the author.
+    Do not write the `generated` block yourself.
+    doc_type: the doc's OKF type (Concept, Decision, Plan, Design, Research,
+    Runbook, Lesson, Log, Reference, Note, or a project's own). Required unless
+    the content starts with frontmatter that has `type:`.
     """
     rel, target = _resolve_kb_rel_path(path)
     if not _is_allowed_kb_write(rel):
@@ -3015,6 +3260,8 @@ def create_kb_doc(path: str, content: str, confirm: bool = False, commit: bool =
             "Allowed: root canonical docs or Projects/<Project>/<NN-STAGE>/<file>.md"
         )
     _kb_reject_degenerate_content(content, "create_kb_doc")
+    _kb_reject_secrets(content, "create_kb_doc")
+    content = _kb_stamp(content, None, rel, actor, "create_kb_doc", doc_type)
 
     exists = target.exists()
     after_hash = _sha256_text(content)
@@ -3069,7 +3316,7 @@ def create_kb_doc(path: str, content: str, confirm: bool = False, commit: bool =
 
 @mcp.tool()
 def update_kb_doc(path: str, content: str, confirm: bool = False, commit: bool = True,
-                  allow_shrink: bool = False) -> dict[str, Any]:
+                  allow_shrink: bool = False, actor: str = "") -> dict[str, Any]:
     """Update a markdown document under the configured KB doc root via Atlas.
 
     Single sanctioned KB write path. Uses propose-confirm by default.
@@ -3078,6 +3325,10 @@ def update_kb_doc(path: str, content: str, confirm: bool = False, commit: bool =
     __PLACEHOLDER__ tokens) are refused, and content dramatically smaller than
     the existing doc is refused unless allow_shrink=True. For partial edits
     prefer replace_kb_section/append_kb_doc.
+
+    actor: REQUIRED. Who is writing, as '<tool>/<model>' or 'process:<id>'. The
+    tool stamps generated.by and the time; a 'human:' actor is refused. Content
+    sent without frontmatter keeps the doc's existing frontmatter.
     """
     rel, target = _resolve_kb_rel_path(path)
     if not _is_allowed_kb_write(rel):
@@ -3090,7 +3341,10 @@ def update_kb_doc(path: str, content: str, confirm: bool = False, commit: bool =
         raise FileNotFoundError(f"KB doc not found: {rel.as_posix()}")
 
     _kb_reject_degenerate_content(content, "update_kb_doc")
-    _kb_reject_unacknowledged_shrink(target.read_text(encoding="utf-8"), content, allow_shrink)
+    _kb_reject_secrets(content, "update_kb_doc")
+    existing_text = target.read_text(encoding="utf-8")
+    _kb_reject_unacknowledged_shrink(existing_text, content, allow_shrink)
+    content = _kb_stamp(content, existing_text, rel, actor, "update_kb_doc")
 
     before_hash = _sha256_file(target)
     after_hash = _sha256_text(content)
@@ -3321,7 +3575,7 @@ def _kb_resolve_existing(path: str) -> tuple[Path, Path]:
 
 
 @mcp.tool()
-def append_kb_doc(path: str, content: str, expected_hash: str = "",
+def append_kb_doc(path: str, content: str, expected_hash: str = "", actor: str = "",
                   confirm: bool = False, commit: bool = True) -> dict[str, Any]:
     """Append text to the end of an existing KB markdown doc, server-side.
 
@@ -3331,10 +3585,15 @@ def append_kb_doc(path: str, content: str, expected_hash: str = "",
 
     expected_hash: optional optimistic guard — the write aborts if the file's
     current hash differs (it changed since you last read it).
+    actor: REQUIRED. Who is writing, as '<tool>/<model>' or 'process:<id>'. The
+    tool stamps generated.by and the time in the doc's frontmatter; a 'human:'
+    actor is refused.
     Propose-confirm: call with confirm=True to apply.
     """
     rel, target = _kb_resolve_existing(path)
-    compute = lambda t: _kb_append_text(t, content)
+    _kb_reject_secrets(content, "append_kb_doc")
+    compute = lambda t: _kb_stamp(
+        kbfm.patch_body(t, lambda b: _kb_append_text(b, content)), t, rel, actor, "append_kb_doc")
     if not confirm:
         return _kb_patch_preview(rel, target, "append_kb_doc", commit, compute)
     return _kb_patch_apply(target, rel, expected_hash, commit, "append", "append_kb_doc", compute)
@@ -3343,7 +3602,7 @@ def append_kb_doc(path: str, content: str, expected_hash: str = "",
 @mcp.tool()
 def replace_kb_section(path: str, anchor: str, content: str, create_missing: bool = False,
                        expected_hash: str = "", confirm: bool = False, commit: bool = True,
-                       allow_whole_file: bool = False) -> dict[str, Any]:
+                       allow_whole_file: bool = False, actor: str = "") -> dict[str, Any]:
     """Replace one markdown section's body in a KB doc, leaving the rest intact.
 
     `anchor` is the heading text (with or without leading #). The matched heading
@@ -3359,38 +3618,63 @@ def replace_kb_section(path: str, anchor: str, content: str, create_missing: boo
       or pass allow_whole_file=True if you really mean to replace everything
       below the title.
     expected_hash: optional optimistic guard (see append_kb_doc).
+    actor: REQUIRED. Who is writing, as '<tool>/<model>' or 'process:<id>'. The
+    tool stamps generated.by and the time in the doc's frontmatter; a 'human:'
+    actor is refused.
     Propose-confirm: call with confirm=True to apply.
     """
     rel, target = _kb_resolve_existing(path)
-    compute = lambda t: _kb_replace_section_text(t, anchor, content, create_missing, allow_whole_file)
+    _kb_reject_secrets(content, "replace_kb_section")
+    compute = lambda t: _kb_stamp(
+        kbfm.patch_body(t, lambda b: _kb_replace_section_text(
+            b, anchor, content, create_missing, allow_whole_file)),
+        t, rel, actor, "replace_kb_section")
     if not confirm:
         return _kb_patch_preview(rel, target, "replace_kb_section", commit, compute)
     return _kb_patch_apply(target, rel, expected_hash, commit, "update", "replace_kb_section", compute)
 
 
 @mcp.tool()
-def check_drift(service_id: str = "", force: bool = False) -> list[dict[str, Any]]:
+def check_drift(service_id: str = "", force: bool = False) -> dict[str, Any]:
     """Run reality probes against running services and report drift.
 
-    By default reads the cached probe result written by the atlas-probe systemd
-    timer (automations/state/atlas_probe_latest.json). Set force=True to run
-    live probes and refresh the cache.
+    With no service_id and force=False it reads the result the atlas-probe timer
+    last wrote (state/atlas_probe_latest.json) and says how old it
+    is. A file older than 30 minutes, or one with no readable time, is REFUSED:
+    the answer is an error naming the age, with no results, because a stale
+    probe file is how old failures were reported as current. Call again with
+    force=True (a live run, which also refreshes the file) or pass a service_id
+    (always live). A fresh install has no probe timer, so until one is set up
+    call check_drift(force=True) or pass a service_id.
 
-    Returns a list of per-service probe results. Each result has:
-    - service_id, name, lifecycle
-    - probes: list of {type, expected, actual, pass}
-    - drift: bool — True if any probe failed
-
-    Pass service_id to filter to one service; omit for all non-retired services.
+    Returns {source: "file"|"live", generated_at, age_seconds, results}. Each
+    result has service_id, name, lifecycle, probes [{type, expected, actual,
+    pass}] and drift (True if any probe failed).
     """
-    PROBE_CACHE = Path("/opt/stack/services/automations/state/atlas_probe_latest.json")
+    PROBE_CACHE = Path(os.environ.get("ATLAS_PROBE_CACHE")
+                       or str(REPO_ROOT / "state" / "atlas_probe_latest.json"))
 
-    if not force and PROBE_CACHE.exists() and not service_id:
+    if not force and not service_id:
+        import json as _json
         try:
-            import json as _json
-            return _json.loads(PROBE_CACHE.read_text(encoding="utf-8")).get("results", [])
+            cached = _json.loads(PROBE_CACHE.read_text(encoding="utf-8"))
+            made = _parse_iso_or_none(cached.get("generated_at"))
         except Exception:
-            pass  # fall through to live run
+            cached, made = None, None
+        age = None if made is None else int((datetime.now(timezone.utc) - made).total_seconds())
+        if cached is not None and age is not None and 0 <= age <= PROBE_FILE_MAX_AGE_SECONDS:
+            return {"source": "file", "generated_at": cached.get("generated_at"),
+                    "age_seconds": age, "results": cached.get("results", [])}
+        return {
+            "error": ("the probe file is missing or unreadable" if cached is None else
+                      "the probe file has no readable time" if age is None else
+                      f"the probe file is {age // 60} minutes old; the limit is "
+                      f"{PROBE_FILE_MAX_AGE_SECONDS // 60}"),
+            "source": "file", "generated_at": (cached or {}).get("generated_at"),
+            "age_seconds": age, "results": [],
+            "hint": "check_drift(force=True) runs the probes now; check_drift(service_id=<id>) "
+                    "measures one service live.",
+        }
 
     import tools.probe_runner as _probe_runner  # local import avoids startup overhead
     results = _probe_runner.run_probes(service_id)
@@ -3413,7 +3697,7 @@ def check_drift(service_id: str = "", force: bool = False) -> list[dict[str, Any
         except Exception:
             pass  # cache write failure is non-fatal
 
-    return results
+    return {"source": "live", "generated_at": _now_iso(), "age_seconds": 0, "results": results}
 
 
 if __name__ == "__main__":
@@ -3486,9 +3770,21 @@ if __name__ == "__main__":
     async def services_rest(request: Request) -> JSONResponse:
         """GET /services — returns all service entities as a JSON object keyed by id.
 
+        Local-only: this route sits outside the
+        MCP auth, so behind a public tunnel it would serve the whole registry to
+        anyone. It answers only a direct loopback caller.
+
         Intended for machine consumers (e.g. catalog.py) that need structured
         data without navigating the MCP streamable-http protocol.
         """
+        if not _direct_loopback(request.scope):
+            return JSONResponse({"error": "Unauthorized"}, status_code=401)
+        if _OAUTH_ENABLED and not _LOCAL_BEARER_INJECT:
+            import hmac as _hmac
+            sent = request.headers.get("authorization", "")
+            want = "Bearer " + _atlas_oauth_provider.ensure_local_token()
+            if not _hmac.compare_digest(sent.encode(), want.encode()):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
         import json as _json
         from datetime import datetime as _dt
         store = _get_store()
@@ -3576,24 +3872,10 @@ if __name__ == "__main__":
         app.routes.insert(0, Route(_OAUTH_LOGIN_PATH, oauth_login, methods=["GET", "POST"]))
 
         # P3 — keep 127.0.0.1 callers (local automations) working by injecting a
-        # stable local-agent bearer before the SDK's auth runs.
+        # stable local-agent bearer before the SDK's auth runs. See the
+        # module-level _LocalBearerInjector class for the proxy-header carve-out.
         _local_token = _atlas_oauth_provider.ensure_local_token()
-
-        class _LocalBearerInjector:
-            def __init__(self, asgi_app):
-                self.app = asgi_app
-
-            async def __call__(self, scope, receive, send):
-                if scope.get("type") == "http":
-                    client = scope.get("client") or ("", 0)
-                    if client[0] in ("127.0.0.1", "::1") and not any(
-                        k == b"authorization" for k, _ in scope.get("headers", [])
-                    ):
-                        scope = dict(scope)
-                        scope["headers"] = list(scope["headers"]) + [
-                            (b"authorization", b"Bearer " + _local_token.encode())
-                        ]
-                await self.app(scope, receive, send)
+        _publish_local_token(_local_token)
     else:
         # Legacy posture: custom (empty) protected-resource doc + X-API-Key gate.
         app.routes.insert(0, Route("/.well-known/oauth-protected-resource", oauth_resource_metadata, methods=["GET"]))
@@ -3617,7 +3899,9 @@ if __name__ == "__main__":
         ],
         expose_headers=["mcp-session-id", "mcp-protocol-version", "x-correlation-id"],
     )
-    if _OAUTH_ENABLED:
-        app.add_middleware(_LocalBearerInjector)  # outermost: inject before SDK auth
+    if _OAUTH_ENABLED and _LOCAL_BEARER_INJECT:
+        app.add_middleware(_LocalBearerInjector, local_token=_local_token)  # outermost: inject before SDK auth
+    if _OAUTH_ENABLED and not _LOCAL_BEARER_INJECT:
+        app.add_middleware(_LoopbackNoOAuthHints)  # outermost: local agents never start OAuth
 
     uvicorn.run(app, host=host, port=port)

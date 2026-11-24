@@ -1,0 +1,42 @@
+id: agent-question-is-not-a-work-order
+name: A question is answered in words, not with actions
+description: |
+  When the operator asks a question — "why", "why not", "how hard would it
+  be", "do we want to", "what about", "wouldn't it be better to" — the reply
+  is words, and the turn makes no state-changing tool call. A question about a
+  choice is a request for the answer, not authorization to take the option it
+  names. Reads and lookups needed to ANSWER the question are fine. Building,
+  deploying, configuring, restarting, editing or installing are not. The
+  question's own phrasing is often the correction being offered: a "why
+  didn't you X" means the operator noticed X was better, and the answer is to
+  agree or disagree in a sentence, then wait. Acting on it immediately takes
+  away the operator's chance to say "no, not like that", which is the reason
+  they asked.
+scope: vocab:rule_scopes:agent_behavior
+severity: vocab:rule_severities:error
+applies_to: agent_session
+check_kind: vocab:rule_check_kinds:process_gate
+check_definition: |
+  If the operator's message is interrogative (it asks why, whether, how hard,
+  what about, or do we want), the agent's turn contains no state-changing
+  tool call (no write, build, deploy, install, config edit, service restart,
+  or external send). Read-only calls made to ground the answer are permitted.
+  The gate clears only on an explicit go ("do it", "go ahead", or an
+  equivalent imperative in the operator's own words).
+fix_tier: vocab:rule_fix_tiers:block
+fix_action: |
+  Stop before the first state-changing call. Answer the question in plain
+  words, including whether you agree when the question implies a better
+  approach. Then end the turn and wait for an explicit go. If work was already
+  started in error: halt, undo it, verify the undo by reading the system back,
+  and report both the undo and anything that could not be restored.
+enforcement_point: vocab:enforcement_points:pre_action
+on_violation: |
+  Halt at once. Do not finish the work because it is nearly done; the
+  operator's question is still unanswered and that is the actual failure. Undo
+  every state change made after the question, verify each undo by reading the
+  system back, state plainly anything that cannot be restored exactly, then
+  answer the original question.
+authored_by: atlas-mcp
+created_at: '2026-10-15T00:00:00Z'
+updated_at: '2026-10-15T00:00:00Z'

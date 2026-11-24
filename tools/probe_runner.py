@@ -6,7 +6,8 @@ Two probe paths based on service host:
   local  (host == the local host id):
     - deployment_path  : filesystem exists check
     - systemd_unit     : systemctl is-active
-    - port             : TCP connect on 127.0.0.1
+    - port             : TCP connect on the health_endpoint's host when that
+                         is a local address, else 127.0.0.1
     - health_endpoint  : HTTP GET status code
 
   remote (host != the local host id, e.g. cloudflare-*):
@@ -36,25 +37,29 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from schemas.service import maintenance_active
+from schemas.service import maintenance_active, quarantine_active
 from tools.store import load_store
 
 SYSTEMD_TIMEOUT = 5   # seconds
 PORT_TIMEOUT = 5       # seconds
 HTTP_TIMEOUT = 10      # seconds
-# _probe_backup_freshness's marker lives on /mnt/nas-nfs: a plain Path.stat() on a
+# systemctl's Result= values that mean a oneshot's last run genuinely failed.
+# "success" and "exec-condition" (a condition-gated skip -- ConditionPathExists
+# etc. evaluated false, so the unit deliberately did not run) are NOT in this
+# set -- both are healthy resting states for a oneshot, not drift.
+ONESHOT_FAILURE_RESULTS = {
+    "exit-code", "signal", "core-dump", "timeout", "watchdog",
+    "resources", "protocol", "start-limit-hit",
+}
+# _probe_backup_freshness's marker may live on a network mount: a plain Path.stat() on a
 # hung NFS mount blocks in uninterruptible I/O with no way to interrupt it from
 # this process. Every other blocking check in this file already runs through a
 # subprocess with a timeout for exactly that reason (SYSTEMD_TIMEOUT/PORT_TIMEOUT/
 # HTTP_TIMEOUT above) -- the marker stat was the one gap, and it is a whole-process
 # gap: run_probes() loops every service sequentially, so one hung stat() here froze
-# ALL 94 services' probes, not just host-backup's. Confirmed 2026-08-01 15:12-16:45:
-# a NAS on the LAN went intermittently unresponsive and atlas-probe.service
-# (PROBE_TIMEOUT=120s in run_atlas_probe.py) timed out 7 times in a row because this
-# stat() never returned within the subprocess's own budget, leaving
-# atlas_probe_latest.json frozen on its last-good snapshot for ~1h46m -- long enough
-# for det.health (which only reads that file) to report an unrelated, already-passed
-# blog-writer health blip as a sustained P1 the whole time the snapshot was stale.
+# every service's probes, not just the backup's. An unresponsive NAS makes the probe
+# run time out over and over, leaving atlas_probe_latest.json frozen on its
+# last-good snapshot, so anything reading that file reports stale results as current.
 BACKUP_STAT_TIMEOUT = 5   # seconds
 # Cloudflare (and other WAFs) return a 403 bot-challenge to the default
 # "Python-urllib/x.y" user-agent, which _probe_http reads as 4xx="server alive"
@@ -70,22 +75,19 @@ PLANNED_LIFECYCLE_ID = "planned"
 LOCAL_HOST_IDS = {os.environ.get("ATLAS_LOCAL_HOST_ID", "local")}
 
 # Relative deployment_paths are anchored here, NOT the probe process CWD — which
-# varies by caller (probe timer runs from /opt/stack/services, the MCP server and
-# dashboard generator run from /opt/stack/atlas-store). Without a fixed anchor a
+# varies by caller (probe timer runs from the services root, the MCP server and
+# dashboard generator run from the engine root). Without a fixed anchor a
 # relative path produces spurious "missing" drift depending on who runs the probe.
 # Env var name matches mcp_server.py's _services_repo_root() (ATLAS_SERVICES_REPO_ROOT,
 # same default) so both processes agree on the anchor when overridden.
-STACK_SERVICES_ROOT = Path(os.environ.get("ATLAS_SERVICES_REPO_ROOT", "/opt/stack/services"))
+STACK_SERVICES_ROOT = Path(os.environ.get("ATLAS_SERVICES_REPO_ROOT", str(Path(__file__).resolve().parent.parent)))
 
 # Services that produce a freshness marker file whose mtime advances only on a
 # successful run. Lets drift surface a backup that is silently failing — the
 # exists/systemd probes stay green when the timer is healthy but rsync errors out.
-BACKUP_FRESHNESS = {
-    "host-backup": {
-        "marker": Path("/mnt/nas-nfs/Backups/host-media/latest.txt"),
-        "max_age_hours": 28.0,  # daily 04:00 run + ~4h grace
-    },
-}
+# Empty by default. Shape, per service_id:
+#   "nightly-backup": {"marker": Path("/srv/backups/latest.txt"), "max_age_hours": 28.0},
+BACKUP_FRESHNESS: dict[str, dict[str, Any]] = {}
 
 
 def _host_id(svc_dict: dict[str, Any]) -> str:
@@ -138,8 +140,7 @@ def _probe_backup_freshness(marker: Path, max_age_hours: float) -> dict[str, Any
     mtime, error = _stat_mtime_guarded(marker)
     if error is not None:
         if error.startswith("stat-timeout"):
-            # Mirrors aegis det.backup's reasoning (automations/aegis/detectors/
-            # services.py): an unresponsive mount is a mount_down fact, not a
+            # An unresponsive mount is a mount_down fact, not a
             # backup_stale fact -- report it as such instead of manufacturing a
             # false "stale" drift from data we simply could not read.
             return {"type": "backup_freshness", "expected": expected, "actual": error, "pass": True}
@@ -150,27 +151,71 @@ def _probe_backup_freshness(marker: Path, max_age_hours: float) -> dict[str, Any
 
 
 def _probe_systemd(unit: str) -> dict[str, Any]:
-    # Single call for both properties: ActiveState alone can't distinguish "unit
+    # Single call for all properties: ActiveState alone can't distinguish "unit
     # exists but is stopped" (inactive/dead, LoadState=loaded) from "unit file is
     # gone" (inactive/dead, LoadState=not-found) -- run_probes() needs that split
     # to apply expected_state semantics correctly (see _apply_expected_state).
+    # Type/Result let this probe judge Type=oneshot units on their own terms
+    # instead of the continuously-active model every other unit type uses (see
+    # ONESHOT_FAILURE_RESULTS and the oneshot branch below).
+    #
+    # Deliberately NOT `--value`: `systemctl show --value` does NOT honor the
+    # requested `-p` property order -- it emits systemd's own fixed internal
+    # property order regardless of how they were listed on the command line
+    # (verified live on this box). Positional parsing of `--value` output is a
+    # landmine that silently mismatches fields the moment systemd's internal
+    # order differs from the requested one. Parsing `Key=Value` lines into a
+    # dict sidesteps the ordering question entirely.
+    props: dict[str, str] = {}
     try:
         result = subprocess.run(
-            ["systemctl", "show", "-p", "LoadState,ActiveState", "--value", unit],
+            ["systemctl", "show", "-p", "LoadState,ActiveState,SubState,Type,Result", unit],
             capture_output=True,
             text=True,
             timeout=SYSTEMD_TIMEOUT,
             check=False,
         )
-        lines = result.stdout.strip().splitlines()
-        load_state = lines[0].strip() if len(lines) > 0 and lines[0].strip() else "unknown"
-        state = lines[1].strip() if len(lines) > 1 and lines[1].strip() else (result.stderr.strip() or "unknown")
+        for line in result.stdout.splitlines():
+            if "=" in line:
+                key, _, value = line.partition("=")
+                props[key.strip()] = value.strip()
+        load_state = props.get("LoadState") or "unknown"
+        state = props.get("ActiveState") or (result.stderr.strip() or "unknown")
     except subprocess.TimeoutExpired:
         load_state, state = "unknown", "timeout"
     except FileNotFoundError:
         load_state, state = "unknown", "systemctl-not-found"
-    passed = state == "active"
-    return {"type": "systemd_unit", "expected": "active", "actual": state, "pass": passed, "load_state": load_state}
+
+    sub_state = props.get("SubState", "")
+    unit_type = props.get("Type", "")
+    result_value = props.get("Result", "")
+
+    if unit_type == "oneshot":
+        # PASS: mid-run or just-finished (active/activating -- RemainAfterExit
+        # units land here), OR resting
+        # inactive with a loaded unit file and a non-failure Result (success,
+        # or exec-condition -- a condition-gated skip is a deliberate no-run,
+        # not a failure). Everything else -- failed, a bad Result, a
+        # not-found unit, or any other ActiveState (deactivating/reloading/
+        # etc) -- fails. Stay conservative on the "any other state" case.
+        passed = state in ("active", "activating") or (
+            state == "inactive"
+            and load_state == "loaded"
+            and result_value not in ONESHOT_FAILURE_RESULTS
+        )
+    else:
+        passed = state == "active"
+
+    return {
+        "type": "systemd_unit",
+        "expected": "active",
+        "actual": state,
+        "pass": passed,
+        "load_state": load_state,
+        "sub_state": sub_state,
+        "unit_type": unit_type,
+        "result": result_value,
+    }
 
 
 def _apply_expected_state(probe: dict[str, Any], expected_state: str) -> dict[str, Any]:
@@ -194,20 +239,19 @@ def _apply_expected_state(probe: dict[str, Any], expected_state: str) -> dict[st
         same reason.
 
       on_demand (scheduled oneshots, e.g. daily governance-chain steps, AND
-      spin-up-when-needed apps, e.g. seedoracle-web -- Jon: "a tool I would
-      seldom use but nice to have", stopped by default, started by hand):
+      spin-up-when-needed apps, e.g. a rarely used tool that is
+      stopped by default and started by hand):
         - systemd_unit: inactive between scheduled runs (or between manual
           start/stop sessions) is healthy, PROVIDED the unit is still loaded
           (LoadState=loaded). A unit systemd can't find at all
-          (load_state=not-found) still reports as drift, per the brief
-          ("not-found unit still is [drift]").
+          (load_state=not-found) still reports as drift.
         - port / container_port / health_endpoint: same fact as the systemd
           unit being stopped, restated three ways -- a closed port and an
           unreachable HTTP endpoint on a deliberately-stopped on_demand
           service are not a second and third independent failure. Excused
           the same as allowed_stopped/retired_ignore. Before this, an
           on_demand service that declared BOTH port and health_endpoint
-          (seedoracle-web, added 2026-07-31) drifted on those two checks
+          drifted on those two checks
           every time it sat in its correct resting state -- a false
           "degraded" on the dashboard for a service nobody asked to be up.
 
@@ -240,12 +284,11 @@ def _apply_lifecycle(probe: dict[str, Any], lifecycle: str) -> dict[str, Any]:
     lifecycle=planned means the entity exists ON PAPER and is deliberately NOT
     built yet. Atlas registers planned services from birth so the units they
     will own are claimed before they exist -- otherwise the capability ledger
-    reports service-desk.timer as UNREGISTERED the instant it is installed.
+    reports a new unit as UNREGISTERED the instant it is installed.
     The cost of that design is that every probe against a planned service is a
     probe against something nobody has written: the unit is not-found, the port
     is closed, the endpoint is unreachable. That is its CORRECT state, not
-    drift, and treating it as drift is how service-desk raised a P1 immediate-
-    lane page (`service_unhealthy:service:service-desk`) for the crime of being
+    drift, and treating it as drift pages someone for the crime of being
     a plan.
 
     So: a planned service passes everything. Unlike expected_state=on_demand,
@@ -259,12 +302,26 @@ def _apply_lifecycle(probe: dict[str, Any], lifecycle: str) -> dict[str, Any]:
     return {**probe, "pass": True, "note": "lifecycle=planned"}
 
 
+def _apply_quarantine(probe: dict[str, Any], svc_dict: dict[str, Any]) -> dict[str, Any]:
+    """While a service is quarantined (set_quarantine: stopped on purpose, stays
+    down until cleared) a failing probe passes with a note saying so. Before
+    2026-11-11 the probe ignored quarantine, so a quarantined service read as drift
+    every 15 minutes and was carded after 24 hours."""
+    if probe.get("pass") or not quarantine_active(svc_dict):
+        return probe
+    q = svc_dict.get("quarantine") or {}
+    if hasattr(q, "model_dump"):
+        q = q.model_dump()
+    reason = (q.get("reason") or "").strip() or "no reason given"
+    return {**probe, "pass": True, "note": f"quarantined since {q.get('since')}: {reason}"}
+
+
 def _apply_maintenance(probe: dict[str, Any], svc_dict: dict[str, Any]) -> dict[str, Any]:
-    """Gate 1.1: while a service's declared maintenance window is active
+    """While a service's declared maintenance window is active
     (unexpired -- see schemas.service.maintenance_active for the read-time
     auto-expiry), every probe against it reports pass. The entity is EXPECTED
     to be disrupted for the declared duration, so a down unit is not drift
-    and Aegis must not raise service_unhealthy for it.
+    and the alerting system must not raise service_unhealthy for it.
 
     Applied broader than -- and after -- both expected_state and lifecycle:
     those describe how a service rests when nothing unusual is happening;
@@ -283,15 +340,112 @@ def _apply_maintenance(probe: dict[str, Any], svc_dict: dict[str, Any]) -> dict[
     return {**probe, "pass": True, "note": f"maintenance until {until_str}: {reason}"}
 
 
-def _probe_port(port: int) -> dict[str, Any]:
+LOOPBACK_HOST = "127.0.0.1"
+
+
+def _is_local_address(addr: str) -> bool:
+    """True when `addr` is an address assigned to THIS machine (loopback included).
+
+    Binding a throwaway UDP socket to the address succeeds only for a locally
+    assigned address (EADDRNOTAVAIL otherwise); nothing is sent. Wildcards are
+    rejected: "0.0.0.0" is not a host a connect() can be aimed at meaningfully.
+    """
+    if addr in ("0.0.0.0", "::"):
+        return False
+    family = socket.AF_INET6 if ":" in addr else socket.AF_INET
     try:
-        with socket.create_connection(("127.0.0.1", port), timeout=PORT_TIMEOUT):
+        with socket.socket(family, socket.SOCK_DGRAM) as s:
+            s.bind((addr, 0))
+        return True
+    except OSError:
+        return False
+
+
+def _port_probe_host(health_endpoint: str | None) -> str:
+    """Host the local port probe connects to.
+
+    A service published on one address only (e.g. a service bound to
+    a LAN address only, no loopback bind) reads "closed" on 127.0.0.1 although
+    it is up. The entity's health_endpoint names the address the service
+    actually answers on, so its host part is used -- but only when that host is
+    an address of this machine (an IP literal, "localhost", or a name that
+    resolves to a local address). A public name (https://app.example.com via the
+    tunnel) or another machine's address says nothing about where the local
+    port is bound, so those, a missing/unparseable endpoint, or an endpoint with
+    no host fall back to loopback, the previous behaviour.
+    """
+    if not health_endpoint:
+        return LOOPBACK_HOST
+    try:
+        host = urllib.parse.urlsplit(str(health_endpoint).strip()).hostname
+    except ValueError:
+        return LOOPBACK_HOST
+    if not host:
+        return LOOPBACK_HOST
+    try:
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except (socket.gaierror, UnicodeError, OSError):
+        return LOOPBACK_HOST
+    for info in infos:
+        addr = info[4][0]
+        if _is_local_address(addr):
+            return addr
+    return LOOPBACK_HOST
+
+
+def _probe_port(port: int, host: str = LOOPBACK_HOST) -> dict[str, Any]:
+    try:
+        with socket.create_connection((host, port), timeout=PORT_TIMEOUT):
             actual = "open"
             passed = True
     except (ConnectionRefusedError, OSError, socket.timeout):
         actual = "closed"
         passed = False
-    return {"type": "port", "expected": f"open:{port}", "actual": actual, "pass": passed}
+    # Loopback keeps the historical "open:<port>" shape; any other host is named.
+    expected = f"open:{port}" if host == LOOPBACK_HOST else f"open:{host}:{port}"
+    return {"type": "port", "expected": expected, "actual": actual, "pass": passed}
+
+
+# Services whose declared `port` is UDP-only (game protocol), keyed by service_id.
+# A plain TCP socket.create_connection() always false-positives "closed" against a
+# UDP-only port: Linux only surfaces ECONNREFUSED on a UDP socket after a real
+# datagram round-trip triggers an ICMP port-unreachable, which a bare TCP connect()
+# never does. These are
+# probed via A2S (Source/GoldSrc query protocol) instead — see _probe_a2s_port
+# (python-a2s is pinned in requirements.txt). Empty by default: add
+# {service_id: description} for each UDP game server the instance runs.
+UDP_A2S_SERVICES: dict[str, str] = {}
+
+# Services whose declared `port` is UDP-only AND do not speak Source/GoldSrc A2S
+# either, so appending them to UDP_A2S_SERVICES would just swap one false
+# failure (TCP connect on a UDP port) for another (an A2S query protocol
+# mismatch). The TCP port probe is skipped outright for these; the
+# already-passing container_port probe (docker inspect + published-port
+# check, see _probe_container_port) carries the liveness claim instead.
+UDP_NO_TCP_PROBE_SERVICES: dict[str, str] = {}
+
+
+def _probe_a2s_port(host: str, port: int) -> dict[str, Any]:
+    """A2S functional probe: a real protocol round-trip (query + parsed reply),
+    not just a socket connect. `a2s` is imported lazily so a missing dependency
+    degrades this one probe to a clear failure instead of crashing every probe."""
+    try:
+        import a2s
+    except ImportError as exc:
+        return {"type": "port", "expected": f"a2s:{port}",
+                "actual": f"python-a2s not installed: {exc}", "pass": False}
+    try:
+        info = a2s.info((host, port), timeout=PORT_TIMEOUT)
+    except Exception as exc:
+        return {"type": "port", "expected": f"a2s:{port}",
+                "actual": f"A2S query to {host}:{port} failed: {type(exc).__name__}: {exc}",
+                "pass": False}
+    return {
+        "type": "port",
+        "expected": f"a2s:{port}",
+        "actual": f"a2s-ok: {info.map_name}, {info.player_count}/{info.max_players} players",
+        "pass": True,
+    }
 
 
 def _probe_container_port(container: str, port: int) -> dict[str, Any]:
@@ -371,7 +525,60 @@ def _probe_unit_port(unit: str, port: int) -> dict[str, Any]:
             "actual": f"declares {sorted(declared)}", "pass": passed}
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Read a 3xx as itself instead of following it off the port.
+
+    redirect_request() returning None makes urllib fall through to
+    http_error_default(), which raises HTTPError(code) -- caught below the
+    same way any other HTTP status is, so the 3xx status survives instead of
+    being followed. Example: a site on 127.0.0.1:8080 that answers plain-HTTP
+    GET / with 301 Location: https://127.0.0.1:8080/ (a force-https setting)
+    while TLS terminates upstream at nginx -- following it does a TLS handshake
+    against a plain-HTTP socket, raises ssl.SSLError WRONG_VERSION_NUMBER, and
+    would read as status=0/"unreachable", a false service_unhealthy on every
+    probe cycle.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def health_endpoint_problem(url: Any) -> str | None:
+    """Return why a health_endpoint value cannot be probed, or None if it can.
+
+    Shared by the probe (so a bad value is one service's failed probe, not a
+    crashed run) and by the Atlas write path in mcp_server.add_service/
+    update_service (so a bad value is refused when it is written). Examples of
+    malformed values: prose around a URL, e.g. "http://127.0.0.1:8080/ (Host:
+    ... required ...)" (urllib: "URL can't contain control characters"), and a
+    bare "/healthz" (urllib: "unknown url type"). Shape only: an
+    absolute http(s) URL with a host, a valid port, and no whitespace.
+    """
+    if not isinstance(url, str) or not url.strip():
+        return "empty or not a string"
+    if url != url.strip() or any(ch.isspace() for ch in url):
+        return "contains whitespace (prose in the field?)"
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        port = parsed.port  # raises ValueError on a non-numeric/out-of-range port
+    except ValueError as exc:
+        return f"unparseable URL: {exc}"
+    if parsed.scheme.lower() not in ("http", "https"):
+        return f"scheme must be http or https, got {parsed.scheme or '(none)'!r}"
+    if not parsed.hostname:
+        return "no host (a bare path like '/healthz' is not probeable)"
+    if port == 0:
+        return "port 0 is not probeable"
+    return None
+
+
 def _probe_http(url: str) -> dict[str, Any]:
+    problem = health_endpoint_problem(url)
+    if problem is not None:
+        # Recorded as this service's failed probe; never raised. "malformed:" is
+        # deliberately NOT "unreachable", so expected_state cannot excuse it.
+        return {"type": "health_endpoint", "expected": "not-5xx/unreachable",
+                "actual": f"malformed: {problem}", "pass": False}
     try:
         req = urllib.request.Request(url, method="GET", headers={"User-Agent": _PROBE_UA})
         scheme = urllib.parse.urlparse(url).scheme.lower()
@@ -380,14 +587,18 @@ def _probe_http(url: str) -> dict[str, Any]:
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
-            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT, context=ctx) as resp:
-                status = resp.status
+            opener = urllib.request.build_opener(
+                _NoRedirectHandler, urllib.request.HTTPSHandler(context=ctx)
+            )
         else:
-            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-                status = resp.status
+            opener = urllib.request.build_opener(_NoRedirectHandler)
+        with opener.open(req, timeout=HTTP_TIMEOUT) as resp:
+            status = resp.status
     except urllib.error.HTTPError as exc:
         status = exc.code
-    except (urllib.error.URLError, OSError, TimeoutError):
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError):
+        # ValueError: http.client.InvalidURL and friends -- anything the shape
+        # check above did not anticipate still lands as "unreachable" here.
         status = 0
 
     # 2xx/3xx = healthy; 4xx = server up but request was malformed (e.g. MCP streamable-http
@@ -410,12 +621,25 @@ def _lifecycle_id(service_dict: dict[str, Any]) -> str:
     return ""
 
 
-def run_probes(service_id: str = "") -> list[dict[str, Any]]:
-    """Run probes for one service (if service_id given) or all non-retired services."""
+def run_probes(service_id: str = "", *, skipped_out: list | None = None) -> list[dict[str, Any]]:
+    """Run probes for one service (if service_id given) or all non-retired services.
+
+    A record the store could not load (``store.skipped``) is not probed. A full
+    run reports each such service record as its own drifted row, probe type
+    ``record_invalid``, and the rest are probed as usual. ``skipped_out``, when
+    given, receives every skipped record of every kind.
+    """
     store = load_store(REPO_ROOT)
     services = store.get("service", {})
+    skipped = list(getattr(store, "skipped", []))
+    if skipped_out is not None:
+        skipped_out.extend(skipped)
+    bad_services = {s["id"]: s for s in skipped if s.get("kind") == "service"}
 
     if service_id:
+        if service_id in bad_services:
+            raise ValueError(f"Service '{service_id}' has an invalid record "
+                             f"({bad_services[service_id]['path']}): {bad_services[service_id]['error']}")
         if service_id not in services:
             raise ValueError(f"Service '{service_id}' not found. Known ids: {sorted(services.keys())}")
         targets = {service_id: services[service_id]}
@@ -426,71 +650,127 @@ def run_probes(service_id: str = "") -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
 
     for sid, svc in sorted(targets.items()):
-        svc_dict = svc.model_dump()
-        probes: list[dict[str, Any]] = []
-        is_local = _host_id(svc_dict) in LOCAL_HOST_IDS
-        probe_mode = "local" if is_local else "remote"
+        try:
+            results.append(_probe_one_service(sid, svc))
+        except Exception as exc:  # noqa: BLE001 -- one bad row must not abort the run
+            # Fault isolation: one service's bad entity field (or any probe bug it
+            # trips) is recorded as THAT service's drift and the run continues over
+            # the rest. Before this, a single malformed health_endpoint raised out
+            # of run_probes(), atlas-probe.service exited non-zero every cycle, and
+            # atlas_probe_latest.json froze for five days (2026-09-15..20).
+            try:
+                svc_dict = svc.model_dump()
+            except Exception:  # noqa: BLE001
+                svc_dict = {}
+            results.append({
+                "service_id": sid,
+                "name": svc_dict.get("name", sid),
+                "lifecycle": _lifecycle_id(svc_dict),
+                "probe_mode": "local" if _host_id(svc_dict) in LOCAL_HOST_IDS else "remote",
+                "probes": [{
+                    "type": "probe_error",
+                    "expected": "probe completes",
+                    "actual": f"{type(exc).__name__}: {exc}",
+                    "pass": False,
+                }],
+                "drift": True,
+            })
 
-        if is_local:
-            deployment_path = svc_dict.get("deployment_path")
-            if deployment_path:
-                probes.append(_probe_path(deployment_path))
-
-            systemd_unit = svc_dict.get("systemd_unit")
-            if systemd_unit:
-                probes.append(_probe_systemd(systemd_unit))
-
-            port = svc_dict.get("port")
-            if port:
-                probes.append(_probe_port(int(port)))
-                container_name = svc_dict.get("container_name")
-                if container_name:
-                    probes.append(_probe_container_port(container_name, int(port)))
-                elif systemd_unit:
-                    probes.append(_probe_unit_port(systemd_unit, int(port)))
-
-            freshness_cfg = BACKUP_FRESHNESS.get(sid)
-            if freshness_cfg:
-                probes.append(_probe_backup_freshness(freshness_cfg["marker"], freshness_cfg["max_age_hours"]))
-
-        # health_endpoint is valid for both local and remote hosts
-        health_endpoint = svc_dict.get("health_endpoint")
-        if health_endpoint:
-            if sid == "atlas-mcp":
-                # Avoid self-probe deadlock: check_drift runs inside atlas-mcp.
-                probes.append({
-                    "type": "health_endpoint",
-                    "expected": "not-5xx/unreachable",
-                    "actual": "skipped-self-probe",
-                    "pass": True,
-                })
-            else:
-                probes.append(_probe_http(health_endpoint))
-
-        expected_state = svc_dict.get("expected_state") or ""
-        probes = [_apply_expected_state(p, expected_state) for p in probes]
-
-        # Applied last, and after expected_state, because it is the broader
-        # statement: expected_state describes how a BUILT service rests,
-        # lifecycle=planned says there is nothing built to rest.
-        lifecycle = _lifecycle_id(svc_dict)
-        probes = [_apply_lifecycle(p, lifecycle) for p in probes]
-
-        # Broadest override, applied last: a declared maintenance window excuses
-        # every probe regardless of lifecycle/expected_state. See _apply_maintenance.
-        probes = [_apply_maintenance(p, svc_dict) for p in probes]
-
-        drift = any(not p["pass"] for p in probes)
-        results.append({
-            "service_id": sid,
-            "name": svc_dict.get("name", sid),
-            "lifecycle": lifecycle,
-            "probe_mode": probe_mode,
-            "probes": probes,
-            "drift": drift,
-        })
+    if not service_id:
+        for sid, bad in sorted(bad_services.items()):
+            results.append({
+                "service_id": sid,
+                "name": sid,
+                "lifecycle": "",
+                "probe_mode": "local",
+                "probes": [{
+                    "type": "record_invalid",
+                    "expected": "the Atlas record loads",
+                    "actual": f"{bad['path']}: {bad['error']}",
+                    "pass": False,
+                }],
+                "drift": True,
+            })
 
     return results
+
+
+def _probe_one_service(sid: str, svc: Any) -> dict[str, Any]:
+    """Probe one service entity and return its drift report (may raise)."""
+    svc_dict = svc.model_dump()
+    probes: list[dict[str, Any]] = []
+    is_local = _host_id(svc_dict) in LOCAL_HOST_IDS
+    probe_mode = "local" if is_local else "remote"
+
+    if is_local:
+        deployment_path = svc_dict.get("deployment_path")
+        if deployment_path:
+            probes.append(_probe_path(deployment_path))
+
+        systemd_unit = svc_dict.get("systemd_unit")
+        if systemd_unit:
+            probes.append(_probe_systemd(systemd_unit))
+
+        port = svc_dict.get("port")
+        if port:
+            port_host = _port_probe_host(svc_dict.get("health_endpoint"))
+            if sid in UDP_A2S_SERVICES:
+                probes.append(_probe_a2s_port(port_host, int(port)))
+            elif sid in UDP_NO_TCP_PROBE_SERVICES:
+                # No TCP probe appended -- the container_port probe below
+                # carries liveness on its own for this service.
+                pass
+            else:
+                probes.append(_probe_port(int(port), port_host))
+            container_name = svc_dict.get("container_name")
+            if container_name:
+                probes.append(_probe_container_port(container_name, int(port)))
+            elif systemd_unit:
+                probes.append(_probe_unit_port(systemd_unit, int(port)))
+
+        freshness_cfg = BACKUP_FRESHNESS.get(sid)
+        if freshness_cfg:
+            probes.append(_probe_backup_freshness(freshness_cfg["marker"], freshness_cfg["max_age_hours"]))
+
+    # health_endpoint is valid for both local and remote hosts
+    health_endpoint = svc_dict.get("health_endpoint")
+    if health_endpoint:
+        if sid == "atlas-mcp":
+            # Avoid self-probe deadlock: check_drift runs inside atlas-mcp.
+            probes.append({
+                "type": "health_endpoint",
+                "expected": "not-5xx/unreachable",
+                "actual": "skipped-self-probe",
+                "pass": True,
+            })
+        else:
+            probes.append(_probe_http(health_endpoint))
+
+    expected_state = svc_dict.get("expected_state") or ""
+    probes = [_apply_expected_state(p, expected_state) for p in probes]
+
+    # Applied last, and after expected_state, because it is the broader
+    # statement: expected_state describes how a BUILT service rests,
+    # lifecycle=planned says there is nothing built to rest.
+    lifecycle = _lifecycle_id(svc_dict)
+    probes = [_apply_lifecycle(p, lifecycle) for p in probes]
+
+    # Broadest override, applied last: a declared maintenance window excuses
+    # every probe regardless of lifecycle/expected_state. See _apply_maintenance.
+    probes = [_apply_maintenance(p, svc_dict) for p in probes]
+    # A quarantine is a deliberate stop that never expires on its own: a
+    # quarantined service that is down is as intended, not drift.
+    probes = [_apply_quarantine(p, svc_dict) for p in probes]
+
+    drift = any(not p["pass"] for p in probes)
+    return {
+        "service_id": sid,
+        "name": svc_dict.get("name", sid),
+        "lifecycle": lifecycle,
+        "probe_mode": probe_mode,
+        "probes": probes,
+        "drift": drift,
+    }
 
 
 if __name__ == "__main__":
@@ -499,13 +779,18 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Run Atlas reality probes")
     parser.add_argument("--service", default="", help="probe a single service by id")
+    parser.add_argument("--envelope", action="store_true",
+                        help='print {"results": [...], "store_skipped": [...]} instead of the bare list')
     args = parser.parse_args()
 
     try:
-        results = run_probes(args.service)
-        print(json.dumps(results, indent=2))
+        skipped: list = []
+        results = run_probes(args.service, skipped_out=skipped)
+        print(json.dumps({"results": results, "store_skipped": skipped} if args.envelope else results,
+                         indent=2))
         drift_count = sum(1 for r in results if r["drift"])
-        print(f"\n{len(results)} services probed. {drift_count} drifted.", file=sys.stderr)
+        print(f"\n{len(results)} services probed. {drift_count} drifted."
+              + (f" {len(skipped)} invalid record(s) skipped." if skipped else ""), file=sys.stderr)
         sys.exit(1 if drift_count else 0)
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

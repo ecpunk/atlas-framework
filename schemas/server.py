@@ -6,6 +6,7 @@ from typing import Optional
 from pydantic import BaseModel, Field, model_validator
 
 from .conventions import TypedRef, validate_iso8601_timestamp
+from .service import ServiceSoftware
 
 
 class Server(BaseModel):
@@ -33,6 +34,12 @@ class Server(BaseModel):
     hosts: list[TypedRef] = Field(default_factory=list)
 
     source_of_truth_doc: Optional[str] = None
+    physical_location: Optional[str] = None
+    notes: list[str] = Field(default_factory=list)
+
+    # Host software no service owns — the OS and
+    # third-party apt packages (gh, Node, PHP, KiCad, ...). Same block as Service.software.
+    software: Optional[ServiceSoftware] = None
 
     created_at: datetime
     updated_at: datetime

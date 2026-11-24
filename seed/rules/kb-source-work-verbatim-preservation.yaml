@@ -1,0 +1,50 @@
+id: kb-source-work-verbatim-preservation
+name: KB Source-Work Verbatim Preservation
+description: |
+  When capturing an external or original WORK someone authored (a paper,
+  essay, letter, spec, article, transcript, or similar standalone document)
+  into the knowledge base, preserve it VERBATIM in full original form. Do not
+  summarize, condense, paraphrase, or excerpt a source work in place of the
+  original.
+
+  Rationale: source works are read infrequently and cost almost nothing to
+  store, but summarizing them destroys detail that cannot be reconstructed
+  later. A condensed capture reads as if it were the whole record, hiding
+  that the original was ever richer.
+
+  Rules:
+  - CAPTURE VERBATIM: import the source work in full, preserving its original
+    wording, structure, and section order. Note provenance (where it came
+    from, when captured, by whom) in a header without altering the body.
+  - SUMMARIES ARE ADDITIVE, NEVER SUBSTITUTIVE: a summary, abstract, index
+    entry, or commentary may be added alongside the verbatim work (a separate
+    doc or a clearly marked section) but never replaces it or stands in as
+    the KB's only copy of the work.
+  - IF ONLY A SUMMARY EXISTS: when a source work is present in the KB only as
+    a summary, obtaining and capturing the verbatim original is the fix, not
+    optional cleanup.
+  - APPLIES to works authored as standalone documents. It does not force
+    verbatim capture of raw logs, telemetry, or transient chatter; those are
+    data, not works.
+scope: vocab:rule_scopes:agent_behavior
+severity: vocab:rule_severities:error
+applies_to: agent_session
+check_kind: vocab:rule_check_kinds:process_gate
+check_definition: |
+  When an agent captures an external or original authored work into the KB,
+  the full verbatim original is stored. A summary, abstract or commentary may
+  accompany it but is not the only KB copy of the work.
+fix_tier: vocab:rule_fix_tiers:block
+fix_action: |
+  Stop. Obtain the full original of the work and capture it verbatim into the
+  KB (provenance header, body unaltered). If a summary is wanted, add it as a
+  separate doc or clearly marked section alongside the original. If the
+  original is not yet available, record that the verbatim capture is still
+  owed rather than letting the summary stand as the record.
+enforcement_point: vocab:enforcement_points:task_closure
+on_violation: |
+  Block task closure until the source work is captured verbatim (or the
+  verbatim capture is explicitly recorded as still owed).
+authored_by: atlas-mcp
+created_at: '2026-10-15T00:00:00Z'
+updated_at: '2026-10-15T00:00:00Z'

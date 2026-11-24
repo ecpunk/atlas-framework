@@ -1,0 +1,28 @@
+id: agent-time-assertion-check
+name: Check the clock before asserting time of day
+description: |
+  Before asserting any time-of-day or relative-day claim to the operator
+  ("last night", "tonight", "this morning", "yesterday's run"), the agent
+  checks the actual current date and time (for example by running `date`) and
+  accounts for timezone: system logs and file timestamps are often UTC, while
+  the operator reads local wall-clock time.
+scope: vocab:rule_scopes:agent_behavior
+severity: vocab:rule_severities:warn
+applies_to: agent_session
+check_kind: vocab:rule_check_kinds:process_gate
+check_definition: |
+  Any operator-facing message containing a relative time-of-day claim (last
+  night, tonight, this morning, yesterday, earlier today, N hours ago) is
+  preceded in the same session by an actual clock check, and the claim is
+  derived from that check with the timestamp source's timezone converted or
+  explicitly labeled.
+fix_tier: vocab:rule_fix_tiers:flag
+fix_action: null
+enforcement_point: vocab:enforcement_points:pre_action
+on_violation: |
+  Re-check the clock, restate the claim with corrected wording (or explicit
+  timezone-labeled timestamps), and prefer absolute timestamps with timezone
+  over relative phrasing when precision matters.
+authored_by: atlas-mcp
+created_at: '2026-10-15T00:00:00Z'
+updated_at: '2026-10-15T00:00:00Z'

@@ -58,7 +58,7 @@ def build_ref_index(store: dict[str, dict[str, BaseModel]]) -> tuple[set[str], d
     """From a loaded Store, build the two lookup sets ref-checking needs.
 
     Returns (entity_refs, vocab_values):
-      entity_refs  {"project:atlas", "service:aegis", ...}   — f"{kind}:{id}"
+      entity_refs  {"project:atlas", "service:alerts", ...}   — f"{kind}:{id}"
       vocab_values {"service_types": {"mcp_http", ...}, ...}
     """
     entity_refs: set[str] = set()

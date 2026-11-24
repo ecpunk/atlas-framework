@@ -7,6 +7,8 @@ from pydantic import BaseModel, Field, model_validator
 
 from .conventions import TypedRef, VocabRef, validate_iso8601_timestamp
 
+CAB_CLASSES = {"standard", "C1", "C2", "C3", "C4", "C5"}
+
 
 class RuntimeTool(BaseModel):
     """One callable of a runtime — the invoke interface a surface discovers.
@@ -22,11 +24,18 @@ class RuntimeTool(BaseModel):
     mutates: bool  # read (runs free) vs write (gated)
     tier: VocabRef  # vocab:action_tiers:{read_only|reversible|new_surface|irreversible}
     args_schema: dict[str, Any] = Field(default_factory=dict)  # JSON-schema-ish arg spec
+    # Change-approval class: "standard", or C1–C5 = the operator decides, for every
+    # principal except operator_direct (see the cab-rules rule entity).
+    # Argument-dependent tools also name a classifier (cab_classifier).
+    cab_class: str = "standard"
+    cab_classifier: Optional[str] = None
 
     @model_validator(mode="after")
     def validate_model(self) -> "RuntimeTool":
         if self.tier.vocab_id != "action_tiers":
             raise ValueError("tier must reference vocab:action_tiers:<value>")
+        if self.cab_class not in CAB_CLASSES:
+            raise ValueError(f"cab_class must be one of {sorted(CAB_CLASSES)}, got {self.cab_class!r}")
         return self
 
 

@@ -41,10 +41,11 @@ values:
     description: Service is intentionally stopped but held for future use.
     semantics: |
       Container stopped and set not to auto-start on boot; excluded from
-      down-alerts (listed in the audit's containers_allowed_stopped) because its
+      down-alerts (its Atlas expected_state is allowed_stopped, with a reason,
+      which the audit reads through the manager's lookup) because its
       absence is deliberate, not a fault. Data/backups retained so it can be
       restored. Distinct from retired (gone for good) and degraded
-      (running-but-impaired). Restore with automations/scripts/restore_service.sh.
+      (running-but-impaired). Restore it with the instance's own restore procedure.
     physical_location: null
     deprecated: false
     deprecated_reason: null

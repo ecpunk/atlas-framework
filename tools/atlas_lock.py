@@ -25,12 +25,23 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import os
+import subprocess
 from pathlib import Path
+
+
+def _git_dir(repo_root: Path) -> Path:
+    # The store may live inside a larger repo, so
+    # repo_root may be a subdirectory with no .git of its own. Ask git which .git owns
+    # it: the store and services then share one lock, which is the point.
+    out = subprocess.run(["git", "-C", str(repo_root), "rev-parse", "--git-common-dir"],
+                         capture_output=True, text=True, check=True).stdout.strip()
+    p = Path(out)
+    return p if p.is_absolute() else Path(repo_root) / p
 
 
 @contextlib.contextmanager
 def atlas_write_lock(repo_root: Path):
-    lock_path = Path(repo_root) / ".git" / "atlas-write.lock"
+    lock_path = _git_dir(Path(repo_root)) / "atlas-write.lock"
     fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)

@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from .conventions import TypedRef, validate_iso8601_timestamp
 
 # Must match the profile names in
-# /opt/stack/services/automations/lib/leak_gate.py (PROFILE_NAMES).
+# the publishing leak gate (its PROFILE_NAMES).
 _LEAK_GATE_PROFILES = {"secrets", "base", "career", "mc-mod"}
 
 

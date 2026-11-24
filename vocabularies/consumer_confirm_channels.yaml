@@ -30,6 +30,17 @@ values:
     physical_location: null
     deprecated: false
     deprecated_reason: null
+  - id: slack_thread_reply
+    name: Slack Thread Reply
+    description: Conversational approval by reply in the originating Slack thread.
+    semantics: |
+      Confirm-first actions stay staged until an explicit, mechanically
+      author-verified reply (confirm phrase or checkmark reaction) lands in the
+      same Slack thread. The confirming author is
+      resolved via the workspace people map, never the model's claim.
+    physical_location: null
+    deprecated: false
+    deprecated_reason: null
   - id: none
     name: None
     description: No confirmation transport.
@@ -40,4 +51,4 @@ values:
     deprecated_reason: null
 extension_policy: open
 created_at: 2026-05-16T00:00:00Z
-updated_at: 2026-05-16T00:00:00Z
+updated_at: 2026-08-22T19:35:00Z
